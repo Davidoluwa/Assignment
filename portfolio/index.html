@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Davun — Game systems and Android engineer</title>
+<meta name="description" content="Davun builds gameplay systems in C/C++ and ships Android apps in Kotlin and TypeScript. Available for contract work.">
+<style>
+  :root {
+    --bg: #0c0f0d; --panel: #141916; --line: #232b26; --text: #e9efe9;
+    --muted: #9aa69d; --accent: #3ddc84; --accent-ink: #06210f;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  a { color: var(--accent); }
+  .wrap { max-width: 1040px; margin: 0 auto; padding: 0 20px; }
+
+  header.top { display: flex; justify-content: space-between; align-items: center; padding: 22px 0; }
+  .brand { font-weight: 800; letter-spacing: .04em; }
+  nav a { color: var(--muted); text-decoration: none; margin-left: 22px; font-size: 14px; }
+  nav a:hover { color: var(--text); }
+
+  .hero { padding: 56px 0 40px; }
+  .tag {
+    display: inline-block; font-size: 13px; color: var(--accent);
+    border: 1px solid var(--line); border-radius: 999px; padding: 4px 12px; margin-bottom: 18px;
+  }
+  h1 { font-size: clamp(32px, 6vw, 56px); line-height: 1.08; margin: 0 0 18px; letter-spacing: -.02em; }
+  .lead { font-size: clamp(17px, 2.2vw, 20px); color: var(--muted); max-width: 680px; margin: 0 0 28px; }
+  .btn {
+    display: inline-block; padding: 12px 20px; border-radius: 10px; font-weight: 700;
+    text-decoration: none; margin: 0 10px 10px 0;
+  }
+  .btn.primary { background: var(--accent); color: var(--accent-ink); }
+  .btn.ghost { border: 1px solid var(--line); color: var(--text); }
+
+  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin: 34px 0 0; }
+  .stat { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 18px; }
+  .stat b { display: block; font-size: 26px; line-height: 1.2; }
+  .stat span { color: var(--muted); font-size: 13px; }
+
+  section { padding: 56px 0; border-top: 1px solid var(--line); }
+  h2 { font-size: 13px; letter-spacing: .14em; text-transform: uppercase; color: var(--muted); margin: 0 0 26px; }
+
+  .project { display: grid; grid-template-columns: 1.1fr 1fr; gap: 32px; align-items: start; margin-bottom: 56px; }
+  .project:last-child { margin-bottom: 0; }
+  .project h3 { font-size: 26px; margin: 0 0 6px; letter-spacing: -.01em; }
+  .project .role { color: var(--accent); font-size: 14px; margin-bottom: 14px; }
+  .project p { color: var(--muted); margin: 0 0 14px; }
+  .project ul { margin: 0 0 16px; padding-left: 18px; }
+  .project li { margin-bottom: 6px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; }
+  .chips span { font-size: 12px; border: 1px solid var(--line); border-radius: 6px; padding: 3px 9px; color: var(--muted); }
+
+  .videos { display: grid; gap: 12px; }
+  .videos.two { grid-template-columns: 1fr 1fr; }
+  .video {
+    display: block; position: relative; border-radius: 12px; overflow: hidden;
+    border: 1px solid var(--line); background: var(--panel); text-decoration: none; color: var(--text);
+  }
+  .video img { display: block; width: 100%; aspect-ratio: 16 / 9; object-fit: cover; }
+  .video span { display: block; padding: 9px 12px; font-size: 13px; color: var(--muted); }
+  .video:hover span { color: var(--text); }
+
+  .arch { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 18px; }
+  .layer { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; margin-bottom: 10px; }
+  .layer:last-child { margin-bottom: 0; }
+  .layer b { display: block; font-size: 14px; }
+  .layer small { color: var(--muted); }
+  .arrow { text-align: center; color: var(--muted); font-size: 12px; margin: -4px 0 6px; }
+
+  .services { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+  .service { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 20px; }
+  .service h3 { margin: 0 0 8px; font-size: 17px; }
+  .service p { margin: 0; color: var(--muted); font-size: 15px; }
+
+  .contact { text-align: center; }
+  .contact h3 { font-size: clamp(26px, 4vw, 38px); margin: 0 0 12px; letter-spacing: -.01em; }
+  .contact p { color: var(--muted); margin: 0 auto 24px; max-width: 560px; }
+  footer { color: var(--muted); font-size: 13px; padding: 28px 0 44px; text-align: center; }
+
+  @media (max-width: 800px) {
+    .project { grid-template-columns: 1fr; gap: 20px; }
+    .stats { grid-template-columns: 1fr 1fr; }
+    .services { grid-template-columns: 1fr; }
+    nav a:not(.keep) { display: none; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="top">
+    <div class="brand">DAVUN</div>
+    <nav>
+      <a href="#work">Work</a>
+      <a href="#services">Services</a>
+      <a class="keep" href="#contact">Contact</a>
+    </nav>
+  </header>
+
+  <div class="hero">
+    <div class="tag">Available for contract work</div>
+    <h1>I build game systems in C/C++ and ship Android apps people use.</h1>
+    <p class="lead">
+      Solo developer. I added a full career mode to a mobile football game that never had one,
+      built the Android platform my community downloads it from, and I'm writing my own
+      open world game for mobile from scratch.
+    </p>
+    <a class="btn primary" href="mailto:anonu143@gmail.com?subject=Contract%20work">Email me</a>
+    <a class="btn ghost" href="https://www.youtube.com/@DavunPes" target="_blank" rel="noopener">Watch the work on YouTube</a>
+
+    <div class="stats">
+      <div class="stat"><b>425,000+</b><span>YouTube views on my builds</span></div>
+      <div class="stat"><b>2,000+</b><span>registered users on SynkPr</span></div>
+      <div class="stat"><b>6,800+</b><span>tracked downloads since May 2026</span></div>
+      <div class="stat"><b>111</b><span>app versions shipped over the air</span></div>
+    </div>
+  </div>
+
+  <section id="work">
+    <h2>Selected work</h2>
+
+    <div class="project">
+      <div>
+        <h3>Davun Edition</h3>
+        <div class="role">Gameplay systems · reverse engineering · C/C++</div>
+        <p>
+          A fan project that adds the modes FIFA 16 Mobile shipped without. I work inside
+          an existing game with no source code and no documentation, and build new systems that
+          hold up across a full season of play.
+        </p>
+        <ul>
+          <li>Manager career mode with transfers, loans, injuries, news and a season calendar</li>
+          <li>Player career mode</li>
+          <li>Champions League tournament mode and street football (Volta) mode</li>
+          <li>New commentary, a weather system and cloth physics</li>
+          <li>Offline save system, with a companion Android app for save management</li>
+        </ul>
+        <div class="chips"><span>C / C++</span><span>Reverse engineering</span><span>Gameplay systems</span><span>Save systems</span><span>Android</span></div>
+      </div>
+      <div class="videos">
+        <a class="video" href="https://www.youtube.com/watch?v=IrjeZCcQZvY" target="_blank" rel="noopener">
+          <img loading="lazy" src="https://i.ytimg.com/vi/IrjeZCcQZvY/hqdefault.jpg" alt="Player career mode gameplay">
+          <span>Player career mode gameplay</span>
+        </a>
+        <div class="videos two">
+          <a class="video" href="https://www.youtube.com/watch?v=Qabhme946U0" target="_blank" rel="noopener">
+            <img loading="lazy" src="https://i.ytimg.com/vi/Qabhme946U0/hqdefault.jpg" alt="Commentary and weather systems">
+            <span>Commentary and weather</span>
+          </a>
+          <a class="video" href="https://www.youtube.com/watch?v=YJmtTnupcpQ" target="_blank" rel="noopener">
+            <img loading="lazy" src="https://i.ytimg.com/vi/YJmtTnupcpQ/hqdefault.jpg" alt="Cloth physics system">
+            <span>Cloth physics</span>
+          </a>
+        </div>
+      </div>
+    </div>
+
+    <div class="project">
+      <div>
+        <h3>SynkPr</h3>
+        <div class="role">Android platform · Kotlin · TypeScript · Postgres</div>
+        <p>
+          A community and distribution app for mobile game mods: a feed, creator profiles, polls,
+          versioned mod releases and a download library. I designed and built every layer.
+        </p>
+        <ul>
+          <li>Kotlin shell that updates its web layer over the air, so most releases need no new APK</li>
+          <li>Background service for downloads, uploads and push notifications</li>
+          <li>Download manager with progress tracking, file compression and per-user usage metering</li>
+          <li>React and TypeScript interface with virtualised lists and an offline cache</li>
+          <li>Postgres backend with custom session auth and a creator application flow</li>
+        </ul>
+        <div class="chips"><span>Kotlin</span><span>TypeScript</span><span>React</span><span>Postgres</span><span>OTA updates</span><span>Firebase Messaging</span></div>
+      </div>
+      <div class="arch">
+        <div class="layer"><b>Web layer</b><small>React, TypeScript, Zustand, Tailwind. Shipped as a versioned bundle.</small></div>
+        <div class="arrow">JavaScript bridge</div>
+        <div class="layer"><b>Native shell</b><small>Kotlin. Update manager, background kernel, credential vault, downloads.</small></div>
+        <div class="arrow">HTTPS</div>
+        <div class="layer"><b>Backend</b><small>Postgres with server functions, file storage, push notifications.</small></div>
+      </div>
+    </div>
+
+    <div class="project">
+      <div>
+        <h3>Open world game for mobile</h3>
+        <div class="role">Original game · C/C++ · in development</div>
+        <p>
+          My own game, written from scratch in C/C++ and running on Android. It's early, and the
+          footage shows where it stands today.
+        </p>
+        <div class="chips"><span>C / C++</span><span>Android</span><span>Built from scratch</span></div>
+      </div>
+      <div class="videos">
+        <a class="video" href="https://www.youtube.com/watch?v=kiOiQRK-TCU" target="_blank" rel="noopener">
+          <img loading="lazy" src="https://i.ytimg.com/vi/kiOiQRK-TCU/hqdefault.jpg" alt="Open world game on mobile, built from scratch">
+          <span>Open world game on mobile, built from scratch</span>
+        </a>
+      </div>
+    </div>
+  </section>
+
+  <section id="services">
+    <h2>What you can hire me for</h2>
+    <div class="services">
+      <div class="service">
+        <h3>Gameplay systems</h3>
+        <p>Career and progression modes, tournaments, save systems and in-game tooling, in C/C++.</p>
+      </div>
+      <div class="service">
+        <h3>Android apps</h3>
+        <p>Native Kotlin, or a Kotlin shell around a web app with over-the-air updates and background work.</p>
+      </div>
+      <div class="service">
+        <h3>Working in code I didn't write</h3>
+        <p>Extending, porting or debugging an existing game or app, including ones with thin documentation.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="contact" class="contact">
+    <h3>Have something that needs building?</h3>
+    <p>Tell me what it is and when you need it. I reply within a day and can start with a small paid trial task.</p>
+    <a class="btn primary" href="mailto:anonu143@gmail.com?subject=Contract%20work">anonu143@gmail.com</a>
+    <a class="btn ghost" href="https://www.youtube.com/@DavunPes" target="_blank" rel="noopener">YouTube: @DavunPes</a>
+  </section>
+
+  <footer>
+    Davun Edition is a fan project and is not affiliated with or endorsed by Electronic Arts.
+  </footer>
+
+</div>
+</body>
+</html>
