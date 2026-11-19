@@ -190,12 +190,19 @@
     <div class="project">
       <div>
         <h3>Open world game for mobile</h3>
-        <div class="role">Original game · C/C++ · in development</div>
+        <div class="role">Original game · custom C++ engine · OpenGL ES 3 · in development</div>
         <p>
-          My own game, written from scratch in C/C++ and running on Android. It's early, and the
-          footage shows where it stands today.
+          My own game on a custom engine, with no Unity or Unreal underneath. It runs on
+          mid-range Android phones and is tuned against real device logs, one release at a time.
         </p>
-        <div class="chips"><span>C / C++</span><span>Android</span><span>Built from scratch</span></div>
+        <ul>
+          <li>Renderer built for phone GPUs: shadow maps, instanced and frustum-culled world, 4x anti-aliasing resolved on-chip, tone mapping inside each shader</li>
+          <li>Two worlds, a city campus and a forest, loaded through a streaming world grid with baked levels of detail</li>
+          <li>Skinned characters with generated skin, hair and cloth materials</li>
+          <li>Physics through Jolt: character controller, ragdolls and vehicles</li>
+          <li>In-game GPU benchmark and profiler, memory trackers, and a headless desktop build for repeatable screenshots and shader checks</li>
+        </ul>
+        <div class="chips"><span>C++</span><span>OpenGL ES 3</span><span>GLSL</span><span>Jolt Physics</span><span>Lua</span><span>Android NDK</span></div>
       </div>
       <div class="videos">
         <a class="video" href="https://www.youtube.com/watch?v=kiOiQRK-TCU" target="_blank" rel="noopener">
