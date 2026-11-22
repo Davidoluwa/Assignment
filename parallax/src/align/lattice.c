@@ -179,8 +179,8 @@ plx_sim plx_lat_fit_sim(const plx_lattice *L, const float *u) {
     return (plx_sim){a, b, my[0] - (a * mx[0] - b * mx[1]), my[1] - (b * mx[0] + a * mx[1])};
 }
 
-plx_sim plx_lat_sim_gauge(const plx_lattice *L, float *u) {
-    plx_sim S = plx_lat_fit_sim(L, u), Si = plx_csim_invert(S);
+void plx_lat_csim_pullback(const plx_lattice *L, plx_sim S, float *u) {
+    plx_sim Si = plx_csim_invert(S);
     int N = plx_lat_nodes(L);
     for (int i = 0; i < L->ny; i++)
         for (int j = 0; j < L->nx; j++) {
@@ -190,6 +190,11 @@ plx_sim plx_lat_sim_gauge(const plx_lattice *L, float *u) {
             u[n] = (float)(qx - px);
             u[N + n] = (float)(qy - py);
         }
+}
+
+plx_sim plx_lat_sim_gauge(const plx_lattice *L, float *u) {
+    plx_sim S = plx_lat_fit_sim(L, u);
+    plx_lat_csim_pullback(L, S, u);
     return S;
 }
 

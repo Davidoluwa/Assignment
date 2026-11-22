@@ -25,8 +25,8 @@
  *   model/            the frozen model for fitting new images (plx_fl_model_load)
  *   diag/             PNG diagnostics and summary.txt with every acceptance number
  *
- * Options: --schedule "step:level:blur:lambda:prox:iters,..." --plain (weights ω instead of
- * ω/(σ²+ε)) --eps-frac --huber --lambda0 --tol --n (first n images, for experiments) --eval-n
+ * Options: --schedule "step:level:blur:lambda:prox:iters:rerender,..." --plain (weights ω instead
+ * of ω/(σ²+ε)) --eps-frac --huber --lambda0 --damp --tol --n (first n images, for experiments) --eval-n
  * (sample size of the evaluations, default 400) --seed --skip-eval. */
 #include "align/canon.h"
 #include "align/congeal.h"
@@ -43,9 +43,14 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Coarse to fine: two 32-px and three 16-px rounds that re-render through the field, then three
+ * 8-px rounds refined by sampling (flow.h, WHY TWO KINDS OF STAGE). λ is stiff because the
+ * template is a population mean: below ~30 the fields chase identity differences (noise-like
+ * fields, folds in 4-80% of faces, see the report); 8-px λ = 100 vs 30 made recovery no worse
+ * and removed folds. */
 #define DEFAULT_SCHEDULE                                                                                             \
-    "32:2:1:0.1:0.3:8,32:2:0.5:0.1:0.3:8,16:1:0.5:0.1:0.3:8,16:1:0:0.1:0.3:8,16:0:0:0.1:1:8,16:0:0:0.1:1:8,"        \
-    "8:0:0:0.3:1:8,8:0:0:0.3:1:8,8:0:0:0.3:1:8,8:0:0:0.3:1:8"
+    "32:2:1:100:1:8:1,32:2:0.5:100:1:8:1,16:1:0:30:1:8:1,16:1:0:30:1:8:1,16:0:0:30:1:8:1,"                         \
+    "8:0:0:100:0.3:10:0,8:0:0:100:0.3:10:0,8:0:0:100:0.3:10:0"
 enum { QCOLS = 7, DOF = 2 * 17 * 21, NODES = 17 * 21, NX = 17, NY = 21 };
 static const char *const QUALITY_COLUMNS[QCOLS] = {"cost", "inlier", "valid", "min_jdet", "max_u", "step", "flags"};
 static const float WHITE[3] = {1, 1, 1}, ARROW[3] = {1.0f, 0.85f, 0.1f}, GUIDE[3] = {1.0f, 0.35f, 0.2f};
@@ -56,9 +61,9 @@ static int parse_schedule(const char *s, plx_fl_stage *st) {
     while (*s) {
         if (n == PLX_FL_MAX_STAGES) plx_die("schedule: more than %d stages", PLX_FL_MAX_STAGES);
         int used = 0;
-        if (sscanf(s, "%d:%d:%f:%f:%f:%d%n", &st[n].step, &st[n].level, &st[n].blur, &st[n].lambda, &st[n].prox,
-                   &st[n].iters, &used) != 6)
-            plx_die("schedule: cannot parse '%s' (want step:level:blur:lambda:prox:iters,...)", s);
+        if (sscanf(s, "%d:%d:%f:%f:%f:%d:%d%n", &st[n].step, &st[n].level, &st[n].blur, &st[n].lambda, &st[n].prox,
+                   &st[n].iters, &st[n].rerender, &used) != 7)
+            plx_die("schedule: cannot parse '%s' (want step:level:blur:lambda:prox:iters:rerender,...)", s);
         n++;
         s += used;
         if (*s == ',') s++;
@@ -130,6 +135,12 @@ static void gauge(plx_sim *T, float *u) {
     *T = plx_sim_compose(*T, plx_lat_sim_gauge(&L, u));
 }
 
+static int n_core_nodes(void) {
+    int c = 0;
+    for (int n = 0; n < NODES; n++) c += core_node(n);
+    return c;
+}
+
 static void compare(plx_sim Ta, const float *ua, plx_sim Tb, const float *ub, plx_sim Tref, double *warp, double *field,
                     double *even) {
     plx_lattice L = plx_lattice_make(PLX_FL_STEP);
@@ -151,22 +162,28 @@ static void compare(plx_sim Ta, const float *ua, plx_sim Tb, const float *ub, pl
     }
 }
 
-static int n_core_nodes(void) {
-    int c = 0;
-    for (int n = 0; n < NODES; n++) c += core_node(n);
-    return c;
-}
 
-static void report_errs(FILE *f, const char *title, errs *e) {
+/* Node-sample mask for report_errs: entry k % (core nodes) of every sample (NULL = all). */
+static const uint8_t *g_mask;
+
+static void report_errs(FILE *f, const char *title, const errs *e) {
+    /* quantile() sorts, so work on copies (the per-sample order is needed afterwards) */
+    int nc = n_core_nodes(), m = 0;
+    double *w = PLX_NEW(double, e->n + 1), *fl = PLX_NEW(double, e->n + 1), *ev = PLX_NEW(double, e->n + 1);
+    for (int k = 0; k < e->n; k++)
+        if (!g_mask || g_mask[k % nc]) w[m] = e->warp[k], fl[m] = e->field[k], ev[m] = e->even[k], m++;
     char line[1024];
     snprintf(line, sizeof line,
              "%s (%d node samples)\n  full warp |W - W'| px:    median %.3f  p95 %.3f\n"
              "  field |u - u'| px (gauge):  median %.3f  p95 %.3f\n"
              "  even part of u_x error px:  median %.3f  p95 %.3f\n",
-             title, e->n, quantile(e->warp, e->n, 0.5), quantile(e->warp, e->n, 0.95), quantile(e->field, e->n, 0.5),
-             quantile(e->field, e->n, 0.95), quantile(e->even, e->n, 0.5), quantile(e->even, e->n, 0.95));
+             title, m, quantile(w, m, 0.5), quantile(w, m, 0.95), quantile(fl, m, 0.5), quantile(fl, m, 0.95),
+             quantile(ev, m, 0.5), quantile(ev, m, 0.95));
     fputs(line, f);
     fputs(line, stderr);
+    free(w);
+    free(fl);
+    free(ev);
 }
 
 /* ---- synthetic deformations for the known-warp recovery test ------------------------------ */
@@ -553,7 +570,8 @@ static void diag_pca(const char *dir, FILE *f, const float *u, const uint8_t *us
     fprintf(f, "  energy fractions of each axis: E = even(u_x) [yaw parallax], O = odd(u_x) [widths, foreshortening],\n"
                "  V = even(u_y) [pitch, heights], Q = odd(u_y) [roll residue, asymmetry];\n"
                "  E centre/side = mean even(u_x) at the centre column / at the outermost core columns (middle rows)\n");
-    fprintf(f, "  pc  var_frac  cum     sd_px    E      O      V      Q    E_centre/side\n");
+    fprintf(f, "  pc  var_frac  cum    rms_px    E      O      V      Q    E_centre/side   (rms_px: per core node and\n"
+               "      component, 1 sd of the component's score)\n");
     plx_img tiles[2 * KP];
     char *lab[2 * KP];
     double cum = 0;
@@ -563,7 +581,7 @@ static void diag_pca(const char *dir, FILE *f, const float *u, const uint8_t *us
         cum += frac;
         const double *a = &PLX_M(&pca.axes, k, 0);
         pc_desc ds = describe_pc(a, cr, cc);
-        fprintf(f, "  %2d  %7.4f  %6.4f  %6.3f  %5.3f  %5.3f  %5.3f  %5.3f  %8.2f\n", k + 1, frac, cum, sqrt(var), ds.e,
+        fprintf(f, "  %2d  %7.4f  %6.4f  %6.3f  %5.3f  %5.3f  %5.3f  %5.3f  %8.2f\n", k + 1, frac, cum, sqrt(var / d), ds.e,
                 ds.o, ds.v, ds.q, ds.centre_side);
         /* drawn at +2 standard deviations */
         field_from_core(a, 2 * sqrt(var), cr, cc, uf);
@@ -591,9 +609,10 @@ static void diag_pca(const char *dir, FILE *f, const float *u, const uint8_t *us
 }
 
 /* ---- node reliability ---------------------------------------------------------------------- */
-/* w_n = (data share of the node's stiffness) x min(1, median cost / node cost): nodes the
- * regulariser has to invent (border) and nodes whose population residual is high (hair, jaw
- * against background, ears) are both down-weighted. Symmetrised. */
+/* w_n ∝ (data share of the node's stiffness) x min(1, median cost / node cost), scaled to max 1:
+ * nodes the regulariser has to invent (border, flat skin) and nodes whose population residual is
+ * high (hair, jaw against background, ears) are both down-weighted. Symmetric (both factors
+ * are). The data share is relative: with the stiff final λ every node is mostly regulariser. */
 static void node_weights(const plx_fl_model *m, const plx_fl_nodestat *ns, float *w, float *datafrac, float *costn) {
     plx_fl_ref ref = plx_fl_ref_build(&m->tmpl, &m->p, &m->stages[m->n_stages - 1]);
     plx_fl_data_fraction(&ref, datafrac);
@@ -608,7 +627,12 @@ static void node_weights(const plx_fl_model *m, const plx_fl_nodestat *ns, float
         if (mass > 0 && core_node(n)) med[nm++] = c[n];
     }
     double cm = quantile(med, nm, 0.5);
-    for (int n = 0; n < NODES; n++) w[n] = isfinite(c[n]) ? datafrac[n] * (float)fmin(1.0, cm / c[n]) : 0.0f;
+    float mx = 0;
+    for (int n = 0; n < NODES; n++) {
+        w[n] = isfinite(c[n]) ? datafrac[n] * (float)fmin(1.0, cm / c[n]) : 0.0f;
+        mx = fmaxf(mx, w[n]);
+    }
+    for (int n = 0; n < NODES; n++) w[n] /= mx;
 }
 
 static void diag_nodes(const char *dir, const float *w, const float *df, const float *cn) {
@@ -755,7 +779,7 @@ int main(int argc, char **argv) {
     fprintf(f, "solver: weights %s, eps_frac=%.3f huber=%.2f*sqrt(K) ramp=%.1f lambda0=%g damp=%g tol=%.3f px\n",
             p->weighting == PLX_FL_W_INVVAR ? "omega/(var+eps)" : "omega (plain)", p->cg.eps_frac, p->cg.huber,
             p->cg.ramp, p->lambda0, p->damp, p->tol);
-    fprintf(f, "schedule (step:level:blur:lambda:prox:iters): %s\n\n", sched_str);
+    fprintf(f, "schedule (step:level:blur:lambda:prox:iters:rerender): %s\n\n", sched_str);
     fprintf(f, "rounds (template of round r = population at the start of round r; sharpness of the mean WARPED gray face):\n");
     fprintf(f, "  round step level blur  lambda   core_var  var/2nd-moment  sharpness  mean_cost  median_last_step  "
                "rms|u|  unconverged   sec\n");
@@ -845,6 +869,18 @@ int main(int argc, char **argv) {
                    "non-similarity part 2-4 px; half random bumps + affine, half 'head turn' x-bumps even in x),\n"
                    "fitted from the original's T with u = 0, compared with W_true(p) = T(p + u(p) + d(p + u(p))):\n");
         report_errs(f, "deformed fit vs d composed with the POPULATION result", &rec_e);
+        {
+            uint8_t mask[NODES];
+            int k = 0, nrel = 0;
+            for (int nn = 0; nn < NODES; nn++)
+                if (core_node(nn)) nrel += (mask[k++] = nw[nn] >= 0.5f);
+            g_mask = mask;
+            char t[160];
+            snprintf(t, sizeof t, "  same, reliable nodes only (node_weight >= 0.5: %d of %d core nodes)", nrel, nc);
+            report_errs(f, t, &rec_e);
+            report_errs(f, "  path independence (below), reliable nodes only", &path_e);
+            g_mask = NULL;
+        }
         report_errs(f, "deformed fit vs d composed with the SINGLE-IMAGE fit of the original (path dependence removed)",
                     &recs_e);
         for (int type = 0; type < 2; type++) {

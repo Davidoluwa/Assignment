@@ -85,6 +85,9 @@ plx_sim plx_lat_fit_sim(const plx_lattice *L, const float *u);
  * full warp W(p) = T(p + u(p)) is unchanged everywhere on the lattice rectangle (S⁻¹ is affine
  * and bilinear weights sum to 1), and u has no similarity component left. */
 plx_sim plx_lat_sim_gauge(const plx_lattice *L, float *u);
+/* u <- S⁻¹(p + u(p)) - p at the nodes for a given canonical similarity S: the field that, with
+ * T o S, gives the same full warp as u with T. */
+void plx_lat_csim_pullback(const plx_lattice *L, plx_sim S, float *u);
 
 /* Minimum over the face-core box [23.5, 103.5] x [23.5, 135.5] of det(I + ∇u): the Jacobian
  * determinant of W relative to its similarity. Within a lattice cell u is bilinear, so the

@@ -378,10 +378,15 @@ static plx_cg_template single_template(const plx_img *base, const plx_cg_params 
 }
 
 static const plx_fl_stage TEST_SCHED[] = {
-    {32, 2, 1.0f, 0.1f, 0.3f, 10}, {16, 1, 0.5f, 0.1f, 0.3f, 10}, {16, 1, 0, 0.1f, 0.3f, 10}, {16, 0, 0, 0.1f, 1, 10},
-    {16, 0, 0, 0.1f, 1, 10},       {16, 0, 0, 0.1f, 1, 10},       {8, 0, 0, 0.3f, 1, 10},    {8, 0, 0, 0.3f, 1, 10},
-    {8, 0, 0, 0.3f, 1, 10},        {8, 0, 0, 0.3f, 1, 10},
+    {32, 2, 1.0f, 0.1f, 0.3f, 10, 1}, {16, 1, 0.5f, 0.1f, 0.3f, 10, 1}, {16, 1, 0, 0.1f, 0.3f, 10, 1},
+    {16, 0, 0, 0.1f, 1, 10, 1},       {16, 0, 0, 0.1f, 1, 10, 1},       {8, 0, 0, 0.3f, 1, 10, 0},
+    {8, 0, 0, 0.3f, 1, 10, 0},        {8, 0, 0, 0.3f, 1, 10, 0},
 };
+
+/* Same schedule with every round re-rendering (damped by the proximal terms, so with four more
+ * 8-px rounds): exactly deformation-equivariant, so it recovers a synthetic warp to the
+ * interpolation floor. */
+static plx_fl_model test_model_rerender(const plx_img *base);
 
 static plx_fl_model test_model(const plx_img *base) {
     plx_fl_model m = {0};
@@ -395,15 +400,29 @@ static plx_fl_model test_model(const plx_img *base) {
     return m;
 }
 
-TEST(recovers_known_warp) {
+static plx_fl_model test_model_rerender(const plx_img *base) {
+    plx_fl_model m = test_model(base);
+    for (int s = 0; s < m.n_stages; s++) m.stages[s].rerender = 1;
+    for (int k = 0; k < 4; k++) m.stages[m.n_stages + k] = m.stages[m.n_stages - 1]; /* damped: needs rounds */
+    m.n_stages += 4;
+    m.p.damp = 0.2f; /* the identity damping is for real faces' large first steps; the pattern has none */
+    return m;
+}
+
+/* Recovery of known smooth warps of a textured pattern. The all-re-render schedule must reach
+ * the interpolation floor; the production-style schedule (sampled 8-px rounds) carries the
+ * strain bias of its fine increment (these fields are strongly strained: |∇u| up to ~0.15) and
+ * gets a looser bound. */
+static void recovery_trials(plx_fl_model *m, double *worst_rms, double *worst_max) {
     plx_img base = blob_pattern(11, 160, true);
-    plx_fl_model m = test_model(&base);
+    plx_cg_template_free(&m->tmpl);
+    m->tmpl = single_template(&base, &m->p.cg);
     plx_fl_fitter f;
-    plx_fl_fitter_init(&f, &m);
+    plx_fl_fitter_init(&f, m);
     plx_lattice L = plx_lattice_make(8);
     plx_rng r;
     plx_rng_seed(&r, 8);
-    double worst = 0, worst_rms = 0;
+    *worst_rms = *worst_max = 0;
     for (int trial = 0; trial < 3; trial++) {
         float ut[DOF8], u[DOF8];
         smooth_field(&r, 6, ut);
@@ -416,13 +435,28 @@ TEST(recovers_known_warp) {
         double e_rms, e_max = warp_dist(T, u, Tt, ut, Tt, &e_rms);
         printf("  trial %d: true field rms %.2f px; error over core nodes rms %.3f, max %.3f px; cost %.4f\n", trial,
                sqrt(rms), e_rms, e_max, fit.cost);
-        worst_rms = fmax(worst_rms, e_rms);
-        worst = fmax(worst, e_max);
+        *worst_rms = fmax(*worst_rms, e_rms);
+        *worst_max = fmax(*worst_max, e_max);
         plx_img_free(&I);
     }
-    CHECK(worst_rms < 0.05);
-    CHECK(worst < 0.2);
     plx_fl_fitter_free(&f);
+    plx_img_free(&base);
+}
+
+TEST(recovers_known_warp) {
+    plx_img base = blob_pattern(11, 160, true);
+    double wr, wm;
+    printf("  all rounds re-render:\n");
+    plx_fl_model m = test_model_rerender(&base);
+    recovery_trials(&m, &wr, &wm);
+    CHECK(wr < 0.04);
+    CHECK(wm < 0.1);
+    plx_fl_model_free(&m);
+    printf("  8-px rounds sampled:\n");
+    m = test_model(&base);
+    recovery_trials(&m, &wr, &wm);
+    CHECK(wr < 0.12);
+    CHECK(wm < 0.5);
     plx_fl_model_free(&m);
     plx_img_free(&base);
 }

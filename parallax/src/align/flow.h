@@ -2,45 +2,59 @@
  * top of congealing's similarity (docs/DESIGN.md §4). Full warp
  *     W_i(p) = T_i(p + u_i(p)),   u_i a lattice field (align/lattice.h), canonical pixels.
  *
- * A round is congealing's loop with a richer warp. Per image:
- *   1. RENDER: C_i(p) = I_i(W_i(p)) on Ω+ (bilinear), orientation channels F_i and pyramid
- *      (congeal.h's view), accumulated into the next template (symmetrised as in congealing).
+ * A round is congealing's loop with a richer warp. Per image the state is (T, ub, a): the photo
+ * is RENDERED through ub, the increment a is SAMPLED on top of it, and the field is
+ * u = a + ub o (id + a) (plx_lat_compose(a, ub)). A re-rendering stage first merges a into ub.
+ *   1. RENDER: C_i(p) = I_i(T_i(p + ub_i(p))) on Ω+ (bilinear), orientation channels and pyramid
+ *      (congeal.h's view); F_i(p) = that view sampled at p + a_i(p). F_i (and the gray image
+ *      rendered through the full warp) is accumulated into the next template, symmetrised as in
+ *      congealing.
  *   2. SOLVE an increment against the current template by inverse-compositional Gauss-Newton.
- *      Template-side field d with C_i(p) ≈ μ(p + d(p)) ≈ μ(p) + ∇μ(p)·d(p); residual
+ *      Template-side field d with F_i(p) ≈ μ(p + d(p)) ≈ μ(p) + ∇μ(p)·d(p); residual
  *      r(p, k) = F_i(p)_k - μ_k(p); Jacobian J = ∇μ_k(p) ⊗ B(p) from TEMPLATE gradients, so
- *          H = Σ_{p,k} w(p,k) JᵀJ + (λ + λp) R + λ0 I
+ *          H = Σ_{p,k} w(p,k) JᵀJ + (λ + λp) R + (δ + λ0) I
  *      is the same for every image: built and Cholesky-factored once per round and stage.
  *      The bending penalty acts on the TOTAL field, which becomes ≈ u - d, so minimising
- *          Σ w (r - J d)² + λ (u - d)ᵀ R (u - d) + λp (a - d)ᵀ R (a - d) + λ0 |u - d|²
- *      (a = the increment accumulated so far this round, see PROXIMAL below) gives
- *          H d = g + λ R u + λp R a + λ0 u,   g = Σ w Jᵀ ψ(r)
+ *          Σ w (r - J d)² + λ (u - d)ᵀ R (u - d) + λ0 |u - d|²
+ *                         + λp (e - d)ᵀ R (e - d) + δ |e - d|²
+ *      (e = a - a0, the increment so far this round; see PROXIMAL) gives
+ *          H d = g + λ R u + λ0 u + λp R e + δ e,   g = Σ w Jᵀ ψ(r)
  *      (ψ: per-pixel Huber clipping of the residual vector; the shared H is not reweighted).
- *      If C(p) ≈ μ(p + d(p)) then C(p - d(p)) ≈ μ(p): the image-side increment is Δ = -d,
- *      composed at the nodes as  u(p_n) <- Δ(p_n) + u(p_n + Δ(p_n))  (plx_lat_compose).
- *      Inner iterations do not re-render: they sample F_i at p + a(p), exactly as congealing
- *      samples F_i(S(p)); the next round re-renders through the new field.
- *   3. GAUGES after the round: the similarity part of u_i moves into T_i (plx_lat_sim_gauge);
- *      the population mean field, symmetrised (x odd, y even), is subtracted from every u_i so
- *      the template stays the mean shape; congealing's mean log-scale / mean ty gauge on T.
+ *      If F(p) ≈ μ(p + d(p)) then F(p - d(p)) ≈ μ(p): the image-side increment is Δ = -d,
+ *      composed at the nodes as  a(p_n) <- Δ(p_n) + a(p_n + Δ(p_n))  (plx_lat_compose).
+ *      Inner iterations do not re-render: they sample at p + a(p), exactly as congealing
+ *      samples F_i(S(p)).
+ *   3. GAUGES after the round: the similarity part of u_i moves into T_i (ub is pulled back
+ *      with it, which leaves the render warp and a unchanged); the population mean field,
+ *      symmetrised (x odd, y even), is subtracted from every u_i (through a) so the template
+ *      stays the mean shape; congealing's mean log-scale / mean ty gauge on T.
  *
- * PROXIMAL TERM. Re-rendering is what makes the result deformation-equivariant (the features
- * of the photo are recomputed in the canonical frame at the current warp, so at the fixed point
- * the photo and any smoothly deformed copy of it give the same residual). But the orientation
+ * WHY TWO KINDS OF STAGE. Re-rendering is what makes the result deformation-equivariant (the
+ * photo's features are recomputed in the canonical frame at the current warp, so at the fixed
+ * point a photo and a smoothly deformed copy of it give the same residual). But the orientation
  * channels respond to a displacement under one 8-px hat very differently from ∇F·B: the hat's
- * strain (ε/8) rotates and rescales the local gradients by about as much as the shift moves
- * them (measured relative model error 0.8-2.7 for an 8-px hat; 0.35 for a 32-px hat; 0.14 for
- * a translation; the same without contrast normalisation). The inner loop converges to its
- * own (sampled-feature) answer, so without damping the round-to-round iteration overshoots
- * in exactly those high-frequency modes and slowly diverges. λp penalises the bending energy
- * of the ROUND's increment: it damps high-frequency increments, leaves affine ones free, and
- * vanishes at the fixed point (a = 0), so it changes the speed, not the answer.
+ * strain (ε/8) rotates and rescales the local gradients about as much as the shift moves them
+ * (measured relative model error 0.8-2.7 for an 8-px hat; 0.35 for a 32-px hat; 0.14 for a
+ * translation; the same without contrast normalisation). So round-to-round re-rendering is
+ * well-behaved on the 32- and 16-px lattices and diverges on the 8-px one (on LFW: rms|u| grew
+ * 4 -> 16 -> 67 px over three 8-px rounds). SAMPLED stages (rerender = 0) keep the last render
+ * and refine only by sampling, where the Gauss-Newton model is exactly self-consistent; the
+ * price is that the fine increment's own strain is not frontalised (small: it is the 8-px
+ * detail on top of the 16-px solution).
+ *
+ * PROXIMAL TERMS. λp (bending) and δ (identity) penalise the increment of the current round
+ * (e = a - a0). They vanish at the fixed point, so they change the speed, not the answer, and
+ * they do not bias the affine part. δ is needed on real faces: from u = 0 the first Gauss-Newton
+ * step against a blurred mean template is a 10-25 px smooth field (bending leaves smooth and
+ * affine modes almost free, and identity differences push them), which then oscillates; δ = 1
+ * bounds the per-round move. λp damps the high-frequency modes whose model is worst.
  *
  * WEIGHTS. w(p, k) = ω(p) / (σ²_k(p) + ε) (INVVAR, congealing's) or ω(p) (PLAIN). ω is
  * congealing's raised-cosine window on Ω. Samples are further scaled by v (fraction of the
  * sample's support that came from inside the photo) and the Huber factor, in g only.
  *
- * REGULARISATION SCALE. λ, λp and λ0 are given relative to the data: the stiffness used is
- *     λ_eff = λ · tr(H_data) / tr(R)  (λp likewise),   λ0_eff = λ0 · tr(H_data) / dof,
+ * REGULARISATION SCALE. λ, λp, δ and λ0 are given relative to the data: the stiffness used is
+ *     λ_eff = λ · tr(H_data) / tr(R)  (λp likewise),   λ0_eff = λ0 · tr(H_data) / dof  (δ likewise),
  * so one λ means the same balance at every pyramid level, lattice and weighting.
  *
  * SYMMETRY. Template, window, weights, lattice and R are σ-symmetric and the gauges commute
@@ -79,6 +93,8 @@ typedef struct {
     float lambda;  /* relative bending weight on the total field */
     float prox;    /* relative bending weight on the round's increment (damping, see PROXIMAL) */
     int   iters;   /* inner Gauss-Newton iterations (no re-render) */
+    int   rerender; /* 1: render through the whole field this round; 0: keep rendering through the
+                     * field as of the last re-rendering round and refine by sampling (SAMPLED) */
 } plx_fl_stage;
 
 /* ---- rendering ------------------------------------------------------------------------ */
@@ -124,10 +140,12 @@ typedef struct {
     int    iters;
     bool   converged; /* last increment < tol before the cap */
 } plx_fl_fit;
-/* Inner iterations against r for view v rendered with field u (on r->lat). u is updated in
- * place to the new total field. ns (optional) receives per-node cost sums at the start. */
-plx_fl_fit plx_fl_solve(const plx_fl_ref *r, const plx_cg_view *v, const plx_fl_params *p, float *u,
-                        const plx_fl_nodestat *ns);
+/* Inner iterations against r for view v rendered with field u (on r->lat), starting from the
+ * image-side increment a (sampled on top of v: the total field is plx_lat_compose(a, u)),
+ * which is updated in place; the proximal terms anchor at a's value on entry. ns (optional)
+ * receives per-node cost sums at the start. */
+plx_fl_fit plx_fl_solve(const plx_fl_ref *r, const plx_cg_view *v, const plx_fl_params *p, const float *u,
+                        float *a, const plx_fl_nodestat *ns);
 
 /* Per-node reliability of a stage's solution: the share of the node's stiffness that comes
  * from data, hdata / (hdata + λ_eff R_nn + λ0_eff), averaged over the two components, then

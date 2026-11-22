@@ -189,8 +189,8 @@ void plx_fl_data_fraction(const plx_fl_ref *r, float *w) {
 }
 
 /* ---- solve ------------------------------------------------------------------------------ */
-plx_fl_fit plx_fl_solve(const plx_fl_ref *r, const plx_cg_view *v, const plx_fl_params *p, float *u,
-                        const plx_fl_nodestat *ns) {
+plx_fl_fit plx_fl_solve(const plx_fl_ref *r, const plx_cg_view *v, const plx_fl_params *p, const float *u,
+                        float *a, const plx_fl_nodestat *ns) {
     int L = r->st.level, K = r->K, w = r->w, h = r->h, N = plx_lat_nodes(&r->lat), dof = 2 * N;
     PLX_ASSERT(L < v->feat.n);
     const plx_img *F = &v->feat.lev[L], *V = &v->vpyr.lev[L];
@@ -204,10 +204,11 @@ plx_fl_fit plx_fl_solve(const plx_fl_ref *r, const plx_cg_view *v, const plx_fl_
     size_t plane = (size_t)w * h;
     double inv_lev = ldexp(1.0, -L);
     double c2 = (double)p->cg.huber * p->cg.huber * K;
-    /* a: this round's increment, image side (the view is sampled at p + a(p)); utot = the total
-     * field it implies */
-    float a[MAX_DOF] = {0}, delta[MAX_DOF], next[MAX_DOF], utot[MAX_DOF];
+    /* a: the image-side increment on top of the render field u (the view is sampled at
+     * p + a(p)); utot = the total field it implies; a0 = a at entry, the proximal anchor */
+    float a0[MAX_DOF], da[MAX_DOF], delta[MAX_DOF], next[MAX_DOF], utot[MAX_DOF];
     double g[MAX_DOF], Ru[MAX_DOF], Ra[MAX_DOF];
+    memcpy(a0, a, sizeof(float) * dof);
     float res[64];
     PLX_ASSERT(K <= 64 && dof <= MAX_DOF);
     plx_fl_fit fit = {0};
@@ -260,12 +261,14 @@ plx_fl_fit plx_fl_solve(const plx_fl_ref *r, const plx_cg_view *v, const plx_fl_
         fit.valid = sov / r->omega_sum;
         if (it == 0) fit.cost0 = fit.cost;
 
-        /* H d = g + λ R utot + λp R a + δ a + λ0 utot (H carries λ + λp and δ + λ0); Δ = -d */
+        /* H d = g + λ R utot + λp R (a - a0) + δ (a - a0) + λ0 utot (H carries λ + λp, δ + λ0);
+         * image side Δ = -d */
         plx_lat_compose(&r->lat, a, u, utot);
+        for (int k = 0; k < dof; k++) da[k] = a[k] - a0[k];
         plx_lat_bending_apply(&r->lat, utot, Ru);
-        plx_lat_bending_apply(&r->lat, a, Ra);
+        plx_lat_bending_apply(&r->lat, da, Ra);
         for (int k = 0; k < dof; k++)
-            g[k] += r->lambda_eff * Ru[k] + r->prox_eff * Ra[k] + r->damp_eff * a[k] + r->lambda0_eff * utot[k];
+            g[k] += r->lambda_eff * Ru[k] + r->prox_eff * Ra[k] + r->damp_eff * da[k] + r->lambda0_eff * utot[k];
         plx_chol_solve_vec(&r->chol, g);
         double step = 0;
         for (int k = 0; k < dof; k++) delta[k] = (float)-g[k];
@@ -277,19 +280,11 @@ plx_fl_fit plx_fl_solve(const plx_fl_ref *r, const plx_cg_view *v, const plx_fl_
         plx_lat_compose(&r->lat, delta, a, next);
         memcpy(a, next, sizeof(float) * dof);
         fit.step = step;
-        if (getenv("DBGS")) {
-            int bn = 0; double bs = 0;
-            for (int n = 0; n < N; n++) { double sn = hypot(delta[n], delta[N + n]); if (sn > bs) bs = sn, bn = n; }
-            fprintf(stderr, "    it %d step %.4f cost %.5f  max step anywhere %.3f at node (row %d col %d) d=(%.2f %.2f)\n", it, step, fit.cost, bs, bn / r->lat.nx, bn % r->lat.nx, delta[bn], delta[N+bn]);
-            if (getenv("DBGF") && it == 0) { for (int c = 0; c < 2; c++) { for (int i = 0; i < r->lat.ny; i++) { for (int j = 0; j < r->lat.nx; j++) fprintf(stderr, "%7.2f", delta[c*N+i*r->lat.nx+j]); fprintf(stderr, "\n"); } fprintf(stderr, "\n"); } }
-        }
         if (step < p->tol) {
             fit.converged = true;
             break;
         }
     }
-    plx_lat_compose(&r->lat, a, u, utot);
-    memcpy(u, utot, sizeof(float) * dof);
     plx_img_free(&Fb);
     return fit;
 }
@@ -314,7 +309,8 @@ int plx_fl_model_save(const plx_fl_model *m, const char *dir) {
     fprintf(f, "stages %d\n", m->n_stages);
     for (int s = 0; s < m->n_stages; s++) {
         const plx_fl_stage *st = &m->stages[s];
-        fprintf(f, "stage %d %d %.9g %.9g %.9g %d\n", st->step, st->level, st->blur, st->lambda, st->prox, st->iters);
+        fprintf(f, "stage %d %d %.9g %.9g %.9g %d %d\n", st->step, st->level, st->blur, st->lambda, st->prox, st->iters,
+                st->rerender);
     }
     fprintf(f, "template_count %lld\n", (long long)m->tmpl.count);
     int bad = fclose(f) != 0;
@@ -344,7 +340,8 @@ int plx_fl_model_load(const char *dir, plx_fl_model *m) {
         if (!strcmp(key, "stage")) {
             plx_fl_stage st;
             ok = m->n_stages < PLX_FL_MAX_STAGES &&
-                 fscanf(f, "%d %d %f %f %f %d", &st.step, &st.level, &st.blur, &st.lambda, &st.prox, &st.iters) == 6;
+                 fscanf(f, "%d %d %f %f %f %d %d", &st.step, &st.level, &st.blur, &st.lambda, &st.prox, &st.iters,
+                        &st.rerender) == 7;
             if (ok) m->stages[m->n_stages++] = st;
         } else if (!strcmp(key, "template_count")) {
             ok = fscanf(f, "%lld", &count) == 1;
@@ -426,28 +423,95 @@ void plx_fl_fitter_free(plx_fl_fitter *f) {
     memset(f, 0, sizeof *f);
 }
 
+/* Per-image state: the field the photo is rendered through (ub) and the increment sampled on
+ * top of it (a), both on the current stage's lattice. The full warp is T(p + compose(a, ub)(p)). */
+static void state_prepare(plx_lattice *lat, const plx_fl_stage *st, float *ub, float *a) {
+    float tmp[MAX_DOF];
+    int dof = plx_lat_dof(lat);
+    if (st->rerender || st->step != lat->step) {
+        plx_lat_compose(lat, a, ub, tmp);
+        memcpy(ub, tmp, sizeof(float) * dof);
+        memset(a, 0, sizeof(float) * dof);
+    }
+    if (st->step != lat->step) {
+        plx_lattice nl = plx_lattice_make(st->step);
+        plx_lat_resample(lat, ub, &nl, tmp);
+        memcpy(ub, tmp, sizeof(float) * plx_lat_dof(&nl));
+        memset(a, 0, sizeof(float) * plx_lat_dof(&nl));
+        *lat = nl;
+    }
+}
+
+/* Similarity gauge of the state: S fitted to the total field, T <- T o S, ub pulled back (a is
+ * unchanged: (id + ub) o (id + a) pulls back as a whole). */
+static void state_sim_gauge(const plx_lattice *lat, plx_sim *T, float *ub, const float *a) {
+    float tot[MAX_DOF];
+    plx_lat_compose(lat, a, ub, tot);
+    plx_sim S = plx_lat_fit_sim(lat, tot);
+    plx_lat_csim_pullback(lat, S, ub);
+    *T = plx_sim_compose(*T, S);
+}
+
+/* out (a new view) = v seen through the increment a: features and validity sampled at p + a(p)
+ * on every level, i.e. what the solver compares with the template; gray rendered through the
+ * total warp. */
+static void warp_level(const plx_img *src, int level, int margin, const plx_lattice *L, const float *a, plx_img *dst) {
+    int w = src->w, h = src->h;
+    size_t plane = (size_t)w * h;
+    double inv = ldexp(1.0, -level);
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++) {
+            double v[2];
+            plx_lat_eval(L, a, plx_pyr_coord((float)x, level, 0) - margin, plx_pyr_coord((float)y, level, 0) - margin, v);
+            double sx = PLX_CLAMP(x + v[0] * inv, 0.0, (double)(w - 1)), sy = PLX_CLAMP(y + v[1] * inv, 0.0, (double)(h - 1));
+            plx_bil_taps t;
+            if (!plx_bil_at(w, h, sx, sy, &t)) PLX_ASSERT(0);
+            for (int k = 0; k < src->c; k++) dst->px[k * plane + (size_t)y * w + x] = plx_bil_eval(src->px + k * plane, &t);
+        }
+}
+
+static void sampled_view(const plx_img *gray, const plx_cg_view *v, plx_sim T, const plx_lattice *L, const float *ub,
+                         const float *a, const plx_cg_params *p, plx_cg_view *out) {
+    float tot[MAX_DOF];
+    plx_lat_compose(L, a, ub, tot);
+    memset(out, 0, sizeof *out);
+    out->gray = plx_canon_new(1, p->margin);
+    out->valid = plx_canon_new(1, p->margin);
+    plx_fl_render_gray(gray, T, L, tot, p->margin, p->interp, &out->gray, &out->valid);
+    out->feat.n = v->feat.n;
+    out->vpyr.n = v->vpyr.n;
+    for (int l = 0; l < v->feat.n; l++) {
+        out->feat.lev[l] = plx_img_new(v->feat.lev[l].w, v->feat.lev[l].h, v->feat.lev[l].c);
+        out->vpyr.lev[l] = plx_img_new(v->vpyr.lev[l].w, v->vpyr.lev[l].h, 1);
+        warp_level(&v->feat.lev[l], l, p->margin, L, a, &out->feat.lev[l]);
+        warp_level(&v->vpyr.lev[l], l, p->margin, L, a, &out->vpyr.lev[l]);
+    }
+}
+
 plx_fl_fit plx_fl_fit_image(const plx_fl_fitter *f, const plx_img *gray, plx_sim T0, plx_sim *T, float *u) {
     const plx_fl_model *m = f->m;
-    float cur[MAX_DOF] = {0}, tmp[MAX_DOF];
+    float ub[MAX_DOF] = {0}, a[MAX_DOF] = {0};
     plx_lattice lat = f->refs[0].lat;
     plx_sim Tc = T0;
     plx_fl_fit fit = {0};
+    plx_cg_view v = {0};
+    bool have_view = false;
     for (int s = 0; s < m->n_stages; s++) {
         const plx_fl_ref *r = &f->refs[s];
-        if (r->lat.step != lat.step) {
-            plx_lat_resample(&lat, cur, &r->lat, tmp);
-            memcpy(cur, tmp, sizeof(float) * plx_lat_dof(&r->lat));
-            lat = r->lat;
+        bool fresh = m->stages[s].rerender || m->stages[s].step != lat.step || !have_view;
+        state_prepare(&lat, &m->stages[s], ub, a);
+        if (fresh) {
+            if (have_view) plx_cg_view_free(&v);
+            plx_fl_render(gray, Tc, &lat, ub, &m->p.cg, &v);
+            have_view = true;
         }
-        plx_cg_view v;
-        plx_fl_render(gray, Tc, &lat, cur, &m->p.cg, &v);
-        fit = plx_fl_solve(r, &v, &m->p, cur, NULL);
-        plx_cg_view_free(&v);
-        Tc = plx_sim_compose(Tc, plx_lat_sim_gauge(&lat, cur));
-        plx_cg_clamp(&Tc, &m->p.cg);
+        fit = plx_fl_solve(r, &v, &m->p, ub, a, NULL);
+        /* the gauge leaves the render warp T(p + ub(p)) unchanged, so a kept view stays valid */
+        state_sim_gauge(&lat, &Tc, ub, a);
     }
+    if (have_view) plx_cg_view_free(&v);
+    plx_lat_compose(&lat, a, ub, u);
     *T = Tc;
-    memcpy(u, cur, sizeof(float) * plx_lat_dof(&lat));
     return fit;
 }
 
@@ -459,7 +523,7 @@ typedef struct {
     const plx_lattice   *lat;
     const uint8_t       *trusted;
     plx_sim             *T;
-    float               *u;       /* [n * stride] */
+    float               *ub, *a;  /* [n * stride] each: render field and sampled increment */
     int                  stride;
     plx_cg_accum        *acc;     /* [threads], NULL in the evaluation pass */
     float               *cost0, *step;
@@ -468,33 +532,47 @@ typedef struct {
     plx_fl_nodestat     *ns;      /* [threads], evaluation pass only (may be NULL) */
 } round_ctx;
 
+static bool core_xy(double x, double y) {
+    return x >= PLX_LAT_CORE_X0 && x <= PLX_LAT_CORE_X1 && y >= PLX_LAT_CORE_Y0 && y <= PLX_LAT_CORE_Y1;
+}
+
 static void round_one(int64_t i, int tid, void *pc) {
     round_ctx *c = pc;
     plx_img g = plx_cg_source_image(c->src, (int)i);
-    float *u = c->u + (size_t)i * c->stride;
+    float *ub = c->ub + (size_t)i * c->stride, *a = c->a + (size_t)i * c->stride;
+    int N = plx_lat_nodes(c->lat), dof = 2 * N;
+    bool sampled = false;
+    for (int k = 0; k < dof && !sampled; k++) sampled = a[k] != 0;
     plx_cg_view v;
-    plx_fl_render(&g, c->T[i], c->lat, u, &c->p->cg, &v);
-    if (c->acc && (!c->trusted || c->trusted[i])) plx_cg_accum_add(&c->acc[tid], &v);
+    plx_fl_render(&g, c->T[i], c->lat, ub, &c->p->cg, &v);
+    if (c->acc && (!c->trusted || c->trusted[i])) {
+        if (sampled) { /* the template sees what the solver compares with it */
+            plx_cg_view sv;
+            sampled_view(&g, &v, c->T[i], c->lat, ub, a, &c->p->cg, &sv);
+            plx_cg_accum_add(&c->acc[tid], &sv);
+            plx_cg_view_free(&sv);
+        } else {
+            plx_cg_accum_add(&c->acc[tid], &v);
+        }
+    }
     if (c->ref) {
         if (c->q) { /* evaluation: measure on a copy, do not move */
-            float tmp[MAX_DOF];
-            memcpy(tmp, u, sizeof(float) * plx_lat_dof(c->lat));
-            plx_fl_fit f = plx_fl_solve(c->ref, &v, c->p, tmp, c->ns ? &c->ns[tid] : NULL);
+            float a2[MAX_DOF], tot[MAX_DOF];
+            memcpy(a2, a, sizeof(float) * dof);
+            plx_fl_fit f = plx_fl_solve(c->ref, &v, c->p, ub, a2, c->ns ? &c->ns[tid] : NULL);
+            plx_lat_compose(c->lat, a, ub, tot);
             float d = 0;
-            int N = plx_lat_nodes(c->lat);
-            for (int k = 0; k < N; k++) {
-                double x = plx_lat_x(c->lat, k % c->lat->nx), y = plx_lat_y(c->lat, k / c->lat->nx);
-                if (x < PLX_LAT_CORE_X0 || x > PLX_LAT_CORE_X1 || y < PLX_LAT_CORE_Y0 || y > PLX_LAT_CORE_Y1) continue;
-                d = fmaxf(d, hypotf(tmp[k] - u[k], tmp[N + k] - u[N + k]));
-            }
+            for (int k = 0; k < N; k++)
+                if (core_xy(plx_lat_x(c->lat, k % c->lat->nx), plx_lat_y(c->lat, k / c->lat->nx)))
+                    d = fmaxf(d, hypotf(a2[k] - a[k], a2[N + k] - a[N + k]));
             c->q[i].cost = (float)f.cost0;
             c->q[i].inlier = (float)f.inlier;
             c->q[i].valid = (float)f.valid;
             c->q[i].step = d;
-            c->q[i].min_jdet = (float)plx_lat_min_jdet(c->lat, u);
-            c->q[i].max_u = (float)plx_lat_max_abs(c->lat, u);
+            c->q[i].min_jdet = (float)plx_lat_min_jdet(c->lat, tot);
+            c->q[i].max_u = (float)plx_lat_max_abs(c->lat, tot);
         } else {
-            plx_fl_fit f = plx_fl_solve(c->ref, &v, c->p, u, NULL);
+            plx_fl_fit f = plx_fl_solve(c->ref, &v, c->p, ub, a, NULL);
             c->cost0[i] = (float)f.cost0;
             c->step[i] = (float)f.step;
             c->conv[i] = f.converged;
@@ -518,34 +596,36 @@ static float median_f(const float *v, int n) {
     return m;
 }
 
-/* Similarity gauge per image, then the symmetrised population-mean field is subtracted, then
- * congealing's scale / ty gauge on T. Returns the mean RMS |u| over core nodes. */
-static double apply_gauges(const plx_lattice *L, plx_sim *T, float *u, int stride, int n, const uint8_t *trusted) {
+/* Similarity gauge per image, then the symmetrised population-mean total field is subtracted
+ * (from the increment: to first order the same), then congealing's scale / ty gauge on T.
+ * Returns the mean RMS |u| over core nodes. */
+static double apply_gauges(const plx_lattice *L, plx_sim *T, float *ub, float *a, int stride, int n,
+                           const uint8_t *trusted) {
     int N = plx_lat_nodes(L), dof = 2 * N, nt = 0;
     double mean[MAX_DOF] = {0};
+    float tot[MAX_DOF];
     for (int i = 0; i < n; i++) {
-        float *ui = u + (size_t)i * stride;
-        T[i] = plx_sim_compose(T[i], plx_lat_sim_gauge(L, ui));
+        float *ubi = ub + (size_t)i * stride, *ai = a + (size_t)i * stride;
+        state_sim_gauge(L, &T[i], ubi, ai);
         if (trusted && !trusted[i]) continue;
-        for (int k = 0; k < dof; k++) mean[k] += ui[k];
+        plx_lat_compose(L, ai, ubi, tot);
+        for (int k = 0; k < dof; k++) mean[k] += tot[k];
         nt++;
     }
-    float mf[MAX_DOF], mm[MAX_DOF];
+    float mf[MAX_DOF] = {0}, mm[MAX_DOF];
     for (int k = 0; k < dof; k++) mf[k] = (float)(mean[k] / PLX_MAX(nt, 1));
     plx_lat_mirror(L, mf, mm);
     for (int k = 0; k < dof; k++) mf[k] = 0.5f * (mf[k] + mm[k]);
     double rms = 0;
     for (int i = 0; i < n; i++) {
-        float *ui = u + (size_t)i * stride;
-        for (int k = 0; k < dof; k++) ui[k] -= mf[k];
+        float *ubi = ub + (size_t)i * stride, *ai = a + (size_t)i * stride;
+        for (int k = 0; k < dof; k++) ai[k] -= mf[k];
+        plx_lat_compose(L, ai, ubi, tot);
         double s = 0;
         int c = 0;
-        for (int k = 0; k < N; k++) {
-            double x = plx_lat_x(L, k % L->nx), y = plx_lat_y(L, k / L->nx);
-            if (x < PLX_LAT_CORE_X0 || x > PLX_LAT_CORE_X1 || y < PLX_LAT_CORE_Y0 || y > PLX_LAT_CORE_Y1) continue;
-            s += (double)ui[k] * ui[k] + (double)ui[N + k] * ui[N + k];
-            c++;
-        }
+        for (int k = 0; k < N; k++)
+            if (core_xy(plx_lat_x(L, k % L->nx), plx_lat_y(L, k / L->nx)))
+                s += (double)tot[k] * tot[k] + (double)tot[N + k] * tot[N + k], c++;
         rms += sqrt(s / c) / n;
     }
     plx_cg_gauge_fix(T, n);
@@ -560,7 +640,7 @@ void plx_fl_congeal(const plx_cg_source *src, const plx_fl_params *p, const plx_
     plx_lattice fine = plx_lattice_make(PLX_FL_STEP);
     int stride = plx_lat_dof(&fine);
     plx_lattice lat = plx_lattice_make(sched[0].step);
-    memset(u, 0, sizeof(float) * (size_t)n * stride);
+    float *ub = PLX_NEW(float, (size_t)n * stride), *a = PLX_NEW(float, (size_t)n * stride);
     plx_cg_accum *acc = PLX_NEW(plx_cg_accum, nt);
     float *cost0 = PLX_NEW(float, n), *step = PLX_NEW(float, n);
     uint8_t *conv = PLX_NEW(uint8_t, n);
@@ -569,20 +649,19 @@ void plx_fl_congeal(const plx_cg_source *src, const plx_fl_params *p, const plx_
     for (int r = 0; r <= n_stages + 1; r++) {
         double t0 = plx_now();
         const plx_fl_stage *st = r >= 1 && r <= n_stages ? &sched[r - 1] : NULL;
-        if (st && st->step != lat.step) { /* refine every field onto the stage's lattice */
-            plx_lattice nl = plx_lattice_make(st->step);
-            float tmp[MAX_DOF];
+        if (st) {
+            plx_lattice nl = lat;
             for (int i = 0; i < n; i++) {
-                plx_lat_resample(&lat, u + (size_t)i * stride, &nl, tmp);
-                memcpy(u + (size_t)i * stride, tmp, sizeof(float) * plx_lat_dof(&nl));
+                nl = lat;
+                state_prepare(&nl, st, ub + (size_t)i * stride, a + (size_t)i * stride);
             }
             lat = nl;
         }
         plx_fl_ref ref = {0};
         if (st) ref = plx_fl_ref_build(&tmpl, p, st);
         for (int t = 0; t < nt; t++) plx_cg_accum_init(&acc[t], &p->cg);
-        round_ctx c = {.src = src, .p = p, .ref = st ? &ref : NULL, .lat = &lat, .trusted = trusted, .T = T, .u = u,
-                       .stride = stride, .acc = acc, .cost0 = cost0, .step = step, .conv = conv};
+        round_ctx c = {.src = src, .p = p, .ref = st ? &ref : NULL, .lat = &lat, .trusted = trusted, .T = T, .ub = ub,
+                       .a = a, .stride = stride, .acc = acc, .cost0 = cost0, .step = step, .conv = conv};
         plx_parallel_for(n, 8, round_one, &c);
         for (int t = 1; t < nt; t++) plx_cg_accum_merge(&acc[0], &acc[t]);
         plx_cg_template_free(&tmpl);
@@ -592,7 +671,7 @@ void plx_fl_congeal(const plx_cg_source *src, const plx_fl_params *p, const plx_
         for (int t = 0; t < nt; t++) plx_cg_accum_free(&acc[t]);
         plx_cg_core_variance(&tmpl, &ri->core_var, &ri->core_ratio);
         if (st) {
-            ri->mean_rms_u = apply_gauges(&lat, T, u, stride, n, trusted);
+            ri->mean_rms_u = apply_gauges(&lat, T, ub, a, stride, n, trusted);
             double sc = 0;
             for (int i = 0; i < n; i++) {
                 sc += cost0[i];
@@ -603,11 +682,11 @@ void plx_fl_congeal(const plx_cg_source *src, const plx_fl_params *p, const plx_
             plx_fl_ref_free(&ref);
         }
         ri->seconds = plx_now() - t0;
-        plx_log("flow round %d%s: step %d level %d blur %.2f lambda %.3g  core var %.2f (ratio %.4f)  cost %.3f"
+        plx_log("flow round %d%s: step %d level %d blur %.2f lambda %.3g%s  core var %.2f (ratio %.4f)  cost %.3f"
                 "  median last step %.3f px  rms|u| %.3f px  unconverged %d  (%.1fs)",
                 r, st ? "" : " (accumulate)", st ? st->step : 0, st ? st->level : -1, st ? st->blur : 0.0f,
-                st ? st->lambda : 0.0f, ri->core_var, ri->core_ratio, ri->mean_cost, ri->median_step, ri->mean_rms_u,
-                ri->n_unconverged, ri->seconds);
+                st ? st->lambda : 0.0f, st && !st->rerender ? " sampled" : "", ri->core_var, ri->core_ratio,
+                ri->mean_cost, ri->median_step, ri->mean_rms_u, ri->n_unconverged, ri->seconds);
     }
 
     /* evaluation pass against the final template with the last stage's setting */
@@ -619,9 +698,13 @@ void plx_fl_congeal(const plx_cg_source *src, const plx_fl_params *p, const plx_
         ns = PLX_NEW(plx_fl_nodestat, nt);
         for (int t = 0; t < nt; t++) ns[t] = (plx_fl_nodestat){PLX_NEW(double, N), PLX_NEW(double, N)};
     }
-    round_ctx c = {.src = src, .p = p, .ref = &ref, .lat = &lat, .T = T, .u = u, .stride = stride, .q = q, .ns = ns};
+    round_ctx c = {.src = src, .p = p, .ref = &ref, .lat = &lat, .T = T, .ub = ub, .a = a, .stride = stride, .q = q,
+                   .ns = ns};
     plx_parallel_for(n, 8, round_one, &c);
-    for (int i = 0; i < n; i++) q[i].converged = conv[i];
+    for (int i = 0; i < n; i++) {
+        q[i].converged = conv[i];
+        plx_lat_compose(&lat, a + (size_t)i * stride, ub + (size_t)i * stride, u + (size_t)i * stride);
+    }
     if (ns) {
         for (int t = 0; t < nt; t++) {
             for (int k = 0; k < N; k++) ns_out->cost[k] += ns[t].cost[k], ns_out->mass[k] += ns[t].mass[k];
@@ -634,6 +717,8 @@ void plx_fl_congeal(const plx_cg_source *src, const plx_fl_params *p, const plx_
     plx_log("flow evaluation pass (%.1fs)", plx_now() - t0);
 
     *final_template = tmpl;
+    free(ub);
+    free(a);
     free(acc);
     free(cost0);
     free(step);
