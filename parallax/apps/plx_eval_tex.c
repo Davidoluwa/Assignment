@@ -12,9 +12,10 @@
  *   roc_<view>_<paradigm>.csv, scores_<view>_<paradigm>.csv
  *   textures.png                      canonical textures before / after photometric normalisation
  *   fails_<view>_<paradigm>.png       most confident false matches and false rejects
- *   ablation.txt                      with --ablation: View 1 ingredient table (View 2 untouched)
+ *   ablation.txt                      with --ablation (a separate mode: nothing else is run or
+ *                                     written): View 1 ingredient table, View 2 untouched
  *
- * Descriptor flags: --blocks SPEC (see plx_desc_parse_blocks), --region x0,y0,w,h, --nosqrt,
+ * Descriptor flags: --blocks SPEC (see plx_desc_parse_blocks), --region x0,y0,w,h, --nosqrt, --nomirror,
  *   --nophoto, --gamma G, --dog0 S, --dog1 S, --tau T, --ori-k K, --ori-unsigned
  * Matcher flags: --score embed|chi2|cos|cell, --pca K, --pca-n N, --global-pca, --nowhiten,
  *   --pca-iters Q, --sup lda|jb|logit, --sup-pca R, --sup-dim M, --ridge R, --l2 L
@@ -37,11 +38,11 @@ enum { SIDE = 250, PIXELS = SIDE * SIDE };
 
 /* ---- configuration --------------------------------------------------------------------- */
 
-static const char *const DEFAULT_BLOCKS = "lbp1:8,lbp2:8,lbp2@1:8,ori:8";
+static const char *const DEFAULT_BLOCKS = "lbp1:12,lbp2:12,lbp2@1:8,ori:12";
 
 static plx_desc_params desc_default(void) {
-    plx_desc_params p = {.x0 = 16, .y0 = 40, .w = 96, .h = 112, .sqrt_hist = true, .photo = plx_photo_default(),
-                         .orient = plx_orient_default()};
+    plx_desc_params p = {.x0 = 16, .y0 = 40, .w = 96, .h = 112, .sqrt_hist = true, .mirror = true,
+                         .photo = plx_photo_default(), .orient = plx_orient_default()};
     if (plx_desc_parse_blocks(DEFAULT_BLOCKS, &p) != PLX_OK) plx_die("bad default block spec");
     return p;
 }
@@ -52,6 +53,7 @@ static plx_desc_params desc_from_args(const plx_args *a) {
     const char *reg = plx_arg_str(a, "region", NULL);
     if (reg && sscanf(reg, "%d,%d,%d,%d", &p.x0, &p.y0, &p.w, &p.h) != 4) plx_die("bad --region (x0,y0,w,h)");
     if (plx_arg_flag(a, "nosqrt")) p.sqrt_hist = false;
+    if (plx_arg_flag(a, "nomirror")) p.mirror = false;
     if (plx_arg_flag(a, "nophoto")) p.photo = plx_photo_none();
     p.photo.gamma = (float)plx_arg_num(a, "gamma", p.photo.gamma);
     p.photo.dog_s0 = (float)plx_arg_num(a, "dog0", p.photo.dog_s0);
@@ -427,25 +429,28 @@ static void run_view(const evaluator *ev, const plx_match_cfg *cfg, bool view2) 
  * View 1 only (View 2 is never touched here). Each row is a set of flags applied to the built-in
  * defaults, exactly as on the command line; rows are cumulative where the label says "+". */
 static const char *const ABLATION[][2] = {
-    {"LBP(8,1) raw histograms, chi-square", "--blocks lbp1:8 --nophoto --nosqrt --score chi2"},
-    {"+ photometric normalisation", "--blocks lbp1:8 --nosqrt --score chi2"},
-    {"+ Hellinger (sqrt), raw cosine", "--blocks lbp1:8 --score cos"},
-    {"+ PCA-whitening, cosine", "--blocks lbp1:8"},
-    {"  same, PCA without whitening", "--blocks lbp1:8 --nowhiten"},
-    {"  same, no photometric normalisation", "--blocks lbp1:8 --nophoto"},
-    {"  same, no sqrt", "--blocks lbp1:8 --nosqrt"},
-    {"LBP(8,2) alone", "--blocks lbp2:8"},
-    {"LBP(8,2) at half resolution alone", "--blocks lbp2@1:8"},
-    {"orientation histograms alone", "--blocks ori:8"},
-    {"LBP(8,1) + LBP(8,2)", "--blocks lbp1:8,lbp2:8"},
-    {"default blocks (all of the above)", ""},
+    {"LBP(8,1) 8px cells, raw hist, chi-square", "--blocks lbp1:8 --nophoto --nosqrt --nomirror --score chi2"},
+    {"+ photometric normalisation", "--blocks lbp1:8 --nosqrt --nomirror --score chi2"},
+    {"+ Hellinger (sqrt), raw cosine", "--blocks lbp1:8 --nomirror --score cos"},
+    {"+ PCA-whitening, cosine", "--blocks lbp1:8 --nomirror"},
+    {"  same, PCA without whitening", "--blocks lbp1:8 --nomirror --nowhiten"},
+    {"  same, no photometric normalisation", "--blocks lbp1:8 --nomirror --nophoto"},
+    {"  same, no sqrt", "--blocks lbp1:8 --nomirror --nosqrt"},
+    {"LBP(8,1) 12px cells alone", "--blocks lbp1:12 --nomirror"},
+    {"LBP(8,2) 12px cells alone", "--blocks lbp2:12 --nomirror"},
+    {"LBP(8,2) half resolution alone", "--blocks lbp2@1:8 --nomirror"},
+    {"orientation histograms alone", "--blocks ori:12 --nomirror"},
+    {"all four blocks", "--nomirror"},
+    {"+ mirror pooling (default, unsupervised)", ""},
+    {"  same, raw cell-weighted Bhattacharyya", "--score cell"},
     {"  same, one global PCA instead of per block", "--global-pca"},
     {"  same, no photometric normalisation", "--nophoto"},
-    {"  PCA dims / 2", "--pca 200"},
-    {"  PCA dims x 2", "--pca 800"},
+    {"  same, PCA dims / 2", "--pca 125"},
+    {"  same, PCA dims x 2", "--pca 500"},
     {"default + pair-LDA (restricted)", "--sup lda"},
-    {"default + joint Bayes (restricted)", "--sup jb"},
+    {"default + joint Bayes (restricted, default)", "--sup jb"},
     {"default + logistic pair model (restricted)", "--sup logit"},
+    {"joint Bayes without mirror pooling", "--nomirror --sup jb"},
 };
 
 static void ablation(const dataset *ds, const char *out) {
@@ -507,6 +512,11 @@ int main(int argc, char **argv) {
 
     dataset ds = {0};
     dataset_open(&ds, &a);
+    if (plx_arg_flag(&a, "ablation")) { /* a mode of its own: leaves report.txt and the cache alone */
+        ablation(&ds, out);
+        dataset_close(&ds);
+        return 0;
+    }
     plx_desc_params dp = desc_from_args(&a);
     plx_match_cfg mc = match_from_args(&a);
 
@@ -529,7 +539,6 @@ int main(int argc, char **argv) {
 
     run_view(&ev, &mc, false);
     if (plx_arg_flag(&a, "view2")) run_view(&ev, &mc, true);
-    if (plx_arg_flag(&a, "ablation")) ablation(&ds, out);
     fprintf(rep, "# total %.1fs\n", plx_now() - t_start);
     fclose(rep);
     plx_log("wrote %s/report.txt", out);

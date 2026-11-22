@@ -40,6 +40,14 @@
 
 #define PLX_CG_MAX_LEVELS 4
 
+/* Face-core box in canonical pixels (the raw LFW mean's face core, docs/DESIGN.md §2), inclusive.
+ * σ-symmetric: 127 - 24 = 103 lies inside, 127 - 104 = 23 just outside, so treat it as
+ * [23.5, 103.5] when symmetry matters (the flow lattice's core nodes do). */
+#define PLX_CG_CORE_X0 24
+#define PLX_CG_CORE_X1 104
+#define PLX_CG_CORE_Y0 21
+#define PLX_CG_CORE_Y1 136
+
 typedef struct {
     plx_orient_params feat;
     int        margin;     /* Ω+ margin, full-resolution pixels */
@@ -67,6 +75,9 @@ typedef struct {
     plx_pyramid feat, vpyr;  /* orientation-channel and validity pyramids of Ω+ */
 } plx_cg_view;
 void plx_cg_render(const plx_img *gray, plx_sim T, const plx_cg_params *p, plx_cg_view *v);
+/* Builds the pyramids of a view whose gray and valid Ω+ images (full resolution, margin
+ * p->margin) the caller has already rendered by some other warp. */
+void plx_cg_view_finish(const plx_cg_params *p, plx_cg_view *v);
 void plx_cg_view_free(plx_cg_view *v);
 
 /* ---- template -------------------------------------------------------------------------- */
@@ -98,6 +109,22 @@ void plx_cg_accum_free(plx_cg_accum *a);
  * (canonical x in [24, 104], y in [21, 136], all channels) and that variance as a fraction of
  * the total second moment Σ(σ² + μ²) there. */
 void plx_cg_core_variance(const plx_cg_template *t, double *total, double *ratio);
+
+/* ---- solver building blocks shared with the flow stage --------------------------------- */
+/* The raised-cosine window ω at canonical point (x, y): 0 on and beyond the Ω border, 1 once
+ * `ramp` pixels inside; σ-symmetric. */
+double plx_cg_window(double x, double y, double ramp);
+/* ω evaluated at the centre of every pixel of the level-`level` Ω+ grid (w x h); caller frees. */
+float *plx_cg_level_window(int w, int h, int level, const plx_cg_params *p);
+/* The variance floor ε = eps_frac * median of var (a level-`level` Ω+ image, all channels) over
+ * the pixels where ω > 0.5. */
+double plx_cg_var_floor(const plx_img *var, int level, const plx_cg_params *p);
+/* Common canonical-side correction G (T_i <- T_i o G for all i) so that mean log scale = 0 and
+ * mean ty = 0. */
+void plx_cg_gauge_fix(plx_sim *T, int n);
+/* Mean squared gradient (Scharr) of an Ω gray face over the face-core box, x 1e4: the sharpness
+ * of a population mean face, independent of the features the alignment optimises. */
+double plx_cg_sharpness(const plx_img *face);
 
 /* ---- per-image solve ------------------------------------------------------------------- */
 /* The template prepared for one stage: blurred mean, gradients, weights, and the precomputed

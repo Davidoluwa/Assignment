@@ -62,6 +62,9 @@ void plx_photo_normalize(plx_img *tex, const plx_img *conf, const plx_photo_para
  * Every pixel's contribution is multiplied by its confidence. Each cell is L1-normalised, then
  * optionally square-rooted (Hellinger mapping, so the dot product of two cells is their
  * Bhattacharyya coefficient). Per-cell weights are the cell's mean confidence in [0, 1].
+ * With `mirror`, each cell's L1 histogram is averaged with that of the mirrored texture (same
+ * cell index = mirror-image location) before the sqrt: the descriptor of a face and its mirror
+ * twin are then identical.
  * Descriptor layout: blocks in order, within a block plx_cell_grid's (cell, bin) order. */
 typedef enum { PLX_BLOCK_LBP1 = 0, PLX_BLOCK_LBP2, PLX_BLOCK_ORI } plx_block_kind;
 
@@ -77,6 +80,7 @@ typedef struct {
     int n_blocks;
     plx_block_spec block[PLX_DESC_MAX_BLOCKS];
     bool sqrt_hist;             /* Hellinger mapping of each L1-normalised cell */
+    bool mirror;                /* pool each cell with its mirror-twin cell (needs 2 x0 + w = 128) */
     plx_photo_params photo;     /* applied to the texture the LBP blocks see */
     plx_orient_params orient;   /* ORI blocks */
 } plx_desc_params;

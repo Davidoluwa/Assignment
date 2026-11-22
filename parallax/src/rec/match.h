@@ -54,7 +54,7 @@ typedef struct {
     double logit_l2;      /* logistic regression penalty on the mean log-loss */
     uint64_t seed;
 } plx_match_cfg;
-plx_match_cfg plx_match_default(void);
+plx_match_cfg plx_match_default(void); /* the best View-1 configuration, unsupervised (sup = NONE) */
 /* unsupervised part only, or both when sup != NONE */
 void plx_match_describe(const plx_match_cfg *c, bool supervised, char *buf, size_t cap);
 

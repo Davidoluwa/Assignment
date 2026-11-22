@@ -10,9 +10,9 @@
 enum { EMBED_CHUNK = 512 };
 
 plx_match_cfg plx_match_default(void) {
-    return (plx_match_cfg){.score = PLX_SCORE_EMBED, .pca_dim = 400, .per_block = true, .whiten = true,
-                           .pca_max_train = 6000, .pca_iters = 2, .sup = PLX_SUP_NONE, .sup_pca = 400,
-                           .sup_dim = 200, .sup_ridge = 0.1, .logit_l2 = 1e-3, .seed = 0x5eedf00d};
+    return (plx_match_cfg){.score = PLX_SCORE_EMBED, .pca_dim = 250, .per_block = true, .whiten = true,
+                           .pca_max_train = 6000, .pca_iters = 2, .sup = PLX_SUP_NONE, .sup_pca = 100,
+                           .sup_dim = 50, .sup_ridge = 0.1, .logit_l2 = 0.01, .seed = 0x5eedf00d};
 }
 
 void plx_match_describe(const plx_match_cfg *c, bool supervised, char *buf, size_t cap) {

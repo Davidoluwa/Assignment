@@ -3,6 +3,7 @@
 
 #include "ops/ops.h"
 
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -54,7 +55,7 @@ void plx_desc_describe(const plx_desc_params *p, char *buf, size_t cap) {
     DESC_PUT("blocks=");
     for (int i = 0; i < p->n_blocks; i++)
         DESC_PUT("%s%s@%d:%d", i ? "," : "", block_names[p->block[i].kind], p->block[i].level, p->block[i].cell);
-    DESC_PUT(" region=%d,%d,%d,%d sqrt=%d", p->x0, p->y0, p->w, p->h, (int)p->sqrt_hist);
+    DESC_PUT(" region=%d,%d,%d,%d sqrt=%d mirror=%d", p->x0, p->y0, p->w, p->h, (int)p->sqrt_hist, (int)p->mirror);
     const plx_photo_params *ph = &p->photo;
     DESC_PUT(" photo=%g,%g,%g,%g,%g", ph->gamma, ph->dog_s0, ph->dog_s1, ph->ce_alpha, ph->ce_tau);
     const plx_orient_params *o = &p->orient;
@@ -62,10 +63,10 @@ void plx_desc_describe(const plx_desc_params *p, char *buf, size_t cap) {
 #undef DESC_PUT
 }
 
-static plx_cell_grid block_grid(const plx_desc_params *p, const plx_block_spec *b, int cells_x, int cells_y) {
+static plx_cell_grid block_grid(const plx_desc_params *p, const plx_block_spec *b, int cells_x, int cells_y,
+                                plx_hist_norm norm) {
     return (plx_cell_grid){.x0 = p->x0 >> b->level, .y0 = p->y0 >> b->level, .w = p->w >> b->level,
-                           .h = p->h >> b->level, .cells_x = cells_x, .cells_y = cells_y,
-                           .norm = p->sqrt_hist ? PLX_HNORM_L1_SQRT : PLX_HNORM_L1, .eps = 1e-6f};
+                           .h = p->h >> b->level, .cells_x = cells_x, .cells_y = cells_y, .norm = norm, .eps = 1e-6f};
 }
 
 plx_desc_layout plx_desc_layout_of(const plx_desc_params *p) {
@@ -122,10 +123,9 @@ static const plx_img *level_norm(level_imgs *lv, const plx_desc_params *p, int l
     return &lv[level].norm;
 }
 
-void plx_desc_compute(const plx_desc_params *p, const plx_img *tex, const plx_img *conf, float *desc,
-                      float *cell_w) {
-    PLX_ASSERT(tex->w == PLX_REC_TEX_W && tex->h == PLX_REC_TEX_H && tex->c == 1);
-    PLX_ASSERT(!conf || (conf->w == tex->w && conf->h == tex->h && conf->c == 1));
+/* One pass over one texture, every cell normalised with `norm`. */
+static void desc_pass(const plx_desc_params *p, const plx_img *tex, const plx_img *conf, plx_hist_norm norm,
+                      float *desc, float *cell_w) {
     plx_desc_layout L = plx_desc_layout_of(p);
     uint8_t uniform[256];
     plx_lbp_uniform_table(uniform);
@@ -138,7 +138,7 @@ void plx_desc_compute(const plx_desc_params *p, const plx_img *tex, const plx_im
         const plx_block_spec *b = &p->block[i];
         level_prepare(lv, b->level, tex, conf);
         const plx_img *cf = &lv[b->level].conf;
-        plx_cell_grid g = block_grid(p, b, L.cells_x[i], L.cells_y[i]);
+        plx_cell_grid g = block_grid(p, b, L.cells_x[i], L.cells_y[i], norm);
         float *out = desc + L.off[i], *bw = cw + L.cell_off[i];
         if (b->kind == PLX_BLOCK_ORI) {
             plx_img ch = plx_orient_channels(&lv[b->level].raw, &p->orient);
@@ -169,4 +169,36 @@ void plx_desc_compute(const plx_desc_params *p, const plx_img *tex, const plx_im
     }
     free(codes);
     free(cw);
+}
+
+void plx_desc_compute(const plx_desc_params *p, const plx_img *tex, const plx_img *conf, float *desc,
+                      float *cell_w) {
+    PLX_ASSERT(tex->w == PLX_REC_TEX_W && tex->h == PLX_REC_TEX_H && tex->c == 1);
+    PLX_ASSERT(!conf || (conf->w == tex->w && conf->h == tex->h && conf->c == 1));
+    if (!p->mirror) {
+        desc_pass(p, tex, conf, p->sqrt_hist ? PLX_HNORM_L1_SQRT : PLX_HNORM_L1, desc, cell_w);
+        return;
+    }
+    /* Mirror pooling: with a region symmetric about the axis, cell c of the mirrored texture
+     * covers the mirror image of cell c, so averaging the two L1 histograms cell by cell gives
+     * a descriptor of the face and its mirror twin at once (exactly mirror-invariant). */
+    PLX_ASSERT(2 * p->x0 + p->w == PLX_REC_TEX_W);
+    plx_desc_layout L = plx_desc_layout_of(p);
+    plx_img ft = plx_img_new(tex->w, tex->h, 1), fc = plx_img_new(tex->w, tex->h, 1);
+    plx_flip_h(tex, &ft);
+    if (conf) plx_flip_h(conf, &fc);
+    float *d2 = PLX_NEW(float, L.d), *w1 = PLX_NEW(float, L.n_cells), *w2 = PLX_NEW(float, L.n_cells);
+    desc_pass(p, tex, conf, PLX_HNORM_L1, desc, w1);
+    desc_pass(p, &ft, conf ? &fc : NULL, PLX_HNORM_L1, d2, w2);
+    for (int j = 0; j < L.d; j++) {
+        float v = 0.5f * (desc[j] + d2[j]);
+        desc[j] = p->sqrt_hist ? sqrtf(v) : v;
+    }
+    if (cell_w)
+        for (int c = 0; c < L.n_cells; c++) cell_w[c] = 0.5f * (w1[c] + w2[c]);
+    free(d2);
+    free(w1);
+    free(w2);
+    plx_img_free(&ft);
+    plx_img_free(&fc);
 }

@@ -2,12 +2,13 @@
  * population loop. See congeal.h for the method. */
 #include "align/congeal.h"
 
+#include "align/align_internal.h"
+
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
-/* Face-core box in canonical pixels (the raw LFW mean's face core, docs/DESIGN.md §2). */
-enum { CORE_X0 = 24, CORE_X1 = 104, CORE_Y0 = 21, CORE_Y1 = 136 };
+enum { CORE_X0 = PLX_CG_CORE_X0, CORE_X1 = PLX_CG_CORE_X1, CORE_Y0 = PLX_CG_CORE_Y0, CORE_Y1 = PLX_CG_CORE_Y1 };
 
 plx_cg_params plx_cg_default(void) {
     plx_cg_params p = {
@@ -33,6 +34,12 @@ void plx_cg_render(const plx_img *gray, plx_sim T, const plx_cg_params *p, plx_c
     v->gray = plx_canon_new(1, p->margin);
     v->valid = plx_canon_new(1, p->margin);
     plx_canon_warp(gray, T, p->margin, p->interp, &v->gray, &v->valid);
+    plx_cg_view_finish(p, v);
+}
+
+void plx_cg_view_finish(const plx_cg_params *p, plx_cg_view *v) {
+    PLX_ASSERT(p->levels >= 1 && p->levels <= PLX_CG_MAX_LEVELS);
+    PLX_ASSERT(v->gray.w == PLX_CANON_W + 2 * p->margin && v->gray.h == PLX_CANON_H + 2 * p->margin);
     plx_img f = plx_orient_channels(&v->gray, &p->feat);
     v->feat = plx_pyramid_build(&f, p->levels, 2);
     v->vpyr = plx_pyramid_build(&v->valid, p->levels, 2);
@@ -170,6 +177,20 @@ void plx_cg_core_variance(const plx_cg_template *t, double *total, double *ratio
     *ratio = s2 > 0 ? sv / s2 : 0;
 }
 
+double plx_cg_sharpness(const plx_img *face) {
+    PLX_ASSERT(face->w == PLX_CANON_W && face->h == PLX_CANON_H && face->c == 1);
+    plx_img gx = plx_img_new(face->w, face->h, 1), gy = plx_img_new(face->w, face->h, 1);
+    plx_gradient_scharr(face, &gx, &gy);
+    double s = 0;
+    int c = 0;
+    for (int y = CORE_Y0; y <= CORE_Y1; y++)
+        for (int x = CORE_X0; x <= CORE_X1; x++, c++)
+            s += PLX_PX(&gx, x, y, 0) * PLX_PX(&gx, x, y, 0) + PLX_PX(&gy, x, y, 0) * PLX_PX(&gy, x, y, 0);
+    plx_img_free(&gx);
+    plx_img_free(&gy);
+    return 1e4 * s / c;
+}
+
 /* ---- reference (template prepared for one stage) -------------------------------------- */
 /* Raised-cosine window on one axis: 0 at and beyond the Ω edge (x = -0.5 or n - 0.5), 1 once
  * `ramp` pixels inside. Symmetric under x -> n - 1 - x, so the window is σ-symmetric. */
@@ -180,9 +201,42 @@ static double window1(double x, int n, double ramp) {
     return 0.5 * (1.0 - cos(M_PI * d / ramp));
 }
 
+double plx_cg_window(double x, double y, double ramp) {
+    return window1(x, PLX_CANON_W, ramp) * window1(y, PLX_CANON_H, ramp);
+}
+
 static int cmp_float(const void *a, const void *b) {
     float x = *(const float *)a, y = *(const float *)b;
     return (x > y) - (x < y);
+}
+
+float *plx_cg_level_window(int w, int h, int level, const plx_cg_params *p) {
+    /* evaluate the full-res window at each level pixel's centre */
+    float *om = PLX_NEW(float, (size_t)w * h);
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++) {
+            double cxp = plx_pyr_coord((float)x, level, 0) - p->margin;
+            double cyp = plx_pyr_coord((float)y, level, 0) - p->margin;
+            om[(size_t)y * w + x] = (float)plx_cg_window(cxp, cyp, p->ramp);
+        }
+    return om;
+}
+
+double plx_cg_var_floor(const plx_img *var, int level, const plx_cg_params *p) {
+    int w = var->w, h = var->h, K = var->c;
+    size_t plane = (size_t)w * h;
+    float *om = plx_cg_level_window(w, h, level, p);
+    float *vals = PLX_NEW(float, plane * K);
+    size_t nv = 0;
+    for (size_t o = 0; o < plane; o++)
+        if (om[o] > 0.5)
+            for (int k = 0; k < K; k++) vals[nv++] = var->px[k * plane + o];
+    PLX_ASSERT(nv > 0);
+    qsort(vals, nv, sizeof(float), cmp_float);
+    double med = vals[nv / 2];
+    free(vals);
+    free(om);
+    return fmax(p->eps_frac * med, 1e-12);
 }
 
 plx_cg_ref plx_cg_ref_build(const plx_cg_template *t, const plx_cg_params *p, int level, float blur) {
@@ -206,28 +260,9 @@ plx_cg_ref plx_cg_ref_build(const plx_cg_template *t, const plx_cg_params *p, in
     plx_img gx = plx_img_new(w, h, K), gy = plx_img_new(w, h, K);
     plx_gradient_scharr(&mu, &gx, &gy);
 
-    /* window in level pixels: evaluate the full-res window at each level pixel's centre */
-    float *om = PLX_NEW(float, plane);
-    float *vals = PLX_NEW(float, plane * K);
-    size_t nv = 0;
-    for (int y = 0; y < h; y++)
-        for (int x = 0; x < w; x++) {
-            double cxp = plx_pyr_coord((float)x, level, 0) - t->margin;
-            double cyp = plx_pyr_coord((float)y, level, 0) - t->margin;
-            double o = window1(cxp, PLX_CANON_W, p->ramp) * window1(cyp, PLX_CANON_H, p->ramp);
-            om[(size_t)y * w + x] = (float)o;
-            if (o > 0.5) {
-                r.n++;
-                for (int k = 0; k < K; k++) vals[nv++] = var.px[k * plane + (size_t)y * w + x];
-            } else if (o > 0) {
-                r.n++;
-            }
-        }
-    PLX_ASSERT(nv > 0);
-    qsort(vals, nv, sizeof(float), cmp_float);
-    double med = vals[nv / 2];
-    r.eps = fmax(p->eps_frac * med, 1e-12);
-    free(vals);
+    float *om = plx_cg_level_window(w, h, level, p);
+    for (size_t o = 0; o < plane; o++) r.n += om[o] > 0;
+    r.eps = plx_cg_var_floor(&var, level, p);
 
     r.X = PLX_NEW(float, r.n);
     r.Y = PLX_NEW(float, r.n);
@@ -312,28 +347,6 @@ static bool solve4(const double Hu[10], const double b[4], double x[4]) {
     return true;
 }
 
-/* Bilinear taps of a w x h grid (w, h >= 2) at a point inside [0, w-1] x [0, h-1]. */
-typedef struct { size_t o; size_t dx, dy; float w00, w10, w01, w11; } bil_taps;
-static inline bool bil(int w, int h, double x, double y, bil_taps *t) {
-    if (!(x >= 0 && y >= 0 && x <= w - 1 && y <= h - 1)) return false;
-    int x0 = (int)x, y0 = (int)y;
-    if (x0 > w - 2) x0 = w - 2;
-    if (y0 > h - 2) y0 = h - 2;
-    float fx = (float)(x - x0), fy = (float)(y - y0);
-    t->o = (size_t)y0 * w + x0;
-    t->dx = 1;
-    t->dy = (size_t)w;
-    t->w00 = (1 - fx) * (1 - fy);
-    t->w10 = fx * (1 - fy);
-    t->w01 = (1 - fx) * fy;
-    t->w11 = fx * fy;
-    return true;
-}
-static inline float bil_eval(const float *p, const bil_taps *t) {
-    const float *q = p + t->o;
-    return t->w00 * q[0] + t->w10 * q[t->dx] + t->w01 * q[t->dy] + t->w11 * q[t->dy + t->dx];
-}
-
 double plx_cg_csim_disp(plx_sim S) {
     static const double cx[2] = {CORE_X0, CORE_X1}, cy[2] = {CORE_Y0, CORE_Y1};
     double m = 0;
@@ -373,14 +386,14 @@ plx_cg_fit plx_cg_solve(const plx_cg_ref *r, const plx_cg_view *v, const plx_cg_
             double X = r->X[i], Y = r->Y[i];
             double x = r->cx + Sl.a * X - Sl.b * Y + Sl.tx;
             double y = r->cy + Sl.b * X + Sl.a * Y + Sl.ty;
-            bil_taps t;
-            if (!bil(w, h, x, y, &t)) continue;
-            float vv = bil_eval(V->px, &t);
+            plx_bil_taps t;
+            if (!plx_bil_at(w, h, x, y, &t)) continue;
+            float vv = plx_bil_eval(V->px, &t);
             if (vv <= 0) continue;
             const float *mu = r->mu + (size_t)i * K, *inv = r->inv + (size_t)i * K;
             double e2 = 0;
             for (int k = 0; k < K; k++) {
-                float d = bil_eval(F->px + k * plane, &t) - mu[k];
+                float d = plx_bil_eval(F->px + k * plane, &t) - mu[k];
                 res[k] = d;
                 e2 += (double)d * d * inv[k];
             }
@@ -514,9 +527,8 @@ static void round_one(int64_t i, int tid, void *pc) {
     plx_img_free(&g);
 }
 
-/* Common canonical-side correction G (T_i <- T_i o G for all i) so that mean log scale = 0 and
- * mean ty = 0. G scales about c0 and then shifts vertically; relative alignment is unchanged. */
-static void gauge_fix(plx_sim *T, int n) {
+/* G scales about c0 and then shifts vertically; relative alignment is unchanged. */
+void plx_cg_gauge_fix(plx_sim *T, int n) {
     double ls = 0;
     for (int i = 0; i < n; i++) ls += log(plx_sim_scale(T[i]));
     plx_sim G = {exp(-ls / n), 0, 0, 0};
@@ -565,7 +577,7 @@ void plx_cg_congeal(const plx_cg_source *src, const plx_cg_params *p, const plx_
         for (int t = 0; t < nt; t++) plx_cg_accum_free(&acc[t]);
         plx_cg_core_variance(&tmpl, &ri->core_var, &ri->core_ratio);
         if (st) {
-            gauge_fix(T, n);
+            plx_cg_gauge_fix(T, n);
             double sc = 0;
             for (int i = 0; i < n; i++) {
                 sc += cost0[i];

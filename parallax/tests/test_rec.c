@@ -207,6 +207,25 @@ TEST(descriptor_weights) {
     plx_img_free(&conf);
 }
 
+TEST(mirror_pooling_is_mirror_invariant) {
+    plx_img t = textured(PLX_REC_TEX_W, PLX_REC_TEX_H, 5), f = plx_img_new(PLX_REC_TEX_W, PLX_REC_TEX_H, 1);
+    plx_flip_h(&t, &f);
+    plx_desc_params p = params_with("lbp1:12,lbp2:12,lbp2@1:8,ori:12");
+    plx_desc_layout L = plx_desc_layout_of(&p);
+    float *d0 = PLX_NEW(float, L.d), *d1 = PLX_NEW(float, L.d);
+    plx_desc_compute(&p, &t, NULL, d0, NULL);
+    plx_desc_compute(&p, &f, NULL, d1, NULL);
+    CHECK(max_diff(d0, d1, L.d) > 0.01f); /* without pooling the mirror is a different descriptor */
+    p.mirror = true;
+    plx_desc_compute(&p, &t, NULL, d0, NULL);
+    plx_desc_compute(&p, &f, NULL, d1, NULL);
+    CHECK(max_diff(d0, d1, L.d) == 0.0f);
+    free(d0);
+    free(d1);
+    plx_img_free(&t);
+    plx_img_free(&f);
+}
+
 TEST(block_spec_parsing) {
     plx_desc_params p = params_with("lbp1:8");
     CHECK(plx_desc_parse_blocks("lbp2@1:6,ori:10", &p) == PLX_OK);
@@ -447,6 +466,7 @@ int main(void) {
     RUN(photometric_invariances);
     RUN(descriptor_photometric_invariance);
     RUN(descriptor_weights);
+    RUN(mirror_pooling_is_mirror_invariant);
     RUN(block_spec_parsing);
     RUN(whitening_cosine_algebra);
     RUN(supervised_separates_two_gaussians);
