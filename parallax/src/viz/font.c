@@ -113,7 +113,8 @@ void plx_text_size(const char *s, int scale, int *w, int *h) {
     int lines = 1, len = 0, maxlen = 0;
     for (; *s; s++) {
         if (*s == '\n') { lines++; len = 0; continue; }
-        maxlen = PLX_MAX(maxlen, ++len);
+        len++;
+        maxlen = PLX_MAX(maxlen, len);
     }
     /* The last glyph's trailing spacing column and the last line gap are not counted. */
     *w = maxlen ? (maxlen * PLX_FONT_ADV - 1) * scale : 0;

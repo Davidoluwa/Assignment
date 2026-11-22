@@ -80,6 +80,18 @@ plx_img plx_render_shaded(const plx_mesh *m, const plx_camera *cam, const plx_ra
 
 /* ---- multi-pose montage --------------------------------------------------------------------- */
 
+/* Short enough to fit a small tile: only the non-zero angles, in whole degrees. */
+static char *pose_label(const plx_pose *p) {
+    const double deg = 180.0 / M_PI, a[3] = {p->yaw * deg, p->pitch * deg, p->roll * deg};
+    static const char *const name[3] = {"yaw", "pitch", "roll"};
+    char buf[64];
+    int len = 0;
+    for (int k = 0; k < 3; k++)
+        if (lround(a[k]) != 0)
+            len += snprintf(buf + len, sizeof buf - (size_t)len, "%s%s %+ld", len ? " " : "", name[k], lround(a[k]));
+    return plx_strdup(len ? buf : "frontal");
+}
+
 plx_img plx_render_views(const plx_img *z, const uint8_t *mask, const plx_img *tex, const plx_pose *poses, int k) {
     PLX_ASSERT(k > 0 && (!tex || tex->c == 1 || tex->c == 3));
     int W = z->w, H = z->h;
@@ -111,15 +123,11 @@ plx_img plx_render_views(const plx_img *z, const uint8_t *mask, const plx_img *t
     char **labels = PLX_NEW(char *, (size_t)rows * k);
     plx_raster_opts ro = {.w = W, .h = H, .cull = PLX_CULL_BACK, .bg = 0.0f};
     plx_shade sh = plx_shade_defaults();
-    const double deg = 180.0 / M_PI;
     for (int j = 0; j < k; j++) {
         plx_camera cam = plx_camera_make(poses[j].yaw, poses[j].pitch, poses[j].roll, s, c, 0.5 * (W - 1),
                                          0.5 * (H - 1));
         tiles[j] = plx_render_shaded(&m, &cam, &ro, &sh);
-        char buf[64];
-        int len = snprintf(buf, sizeof buf, "yaw %+.0f pitch %+.0f", poses[j].yaw * deg, poses[j].pitch * deg);
-        if (poses[j].roll != 0) snprintf(buf + len, sizeof buf - (size_t)len, " roll %+.0f", poses[j].roll * deg);
-        labels[j] = plx_strdup(buf);
+        labels[j] = pose_label(&poses[j]);
         if (tex) {
             plx_raster r;
             plx_render(&m, &cam, &ro, &r);

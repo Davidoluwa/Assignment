@@ -165,16 +165,18 @@ TEST(drawing_coverage) {
     plx_img_free(&im);
 
     im = plx_img_new(20, 20, 3);
-    plx_draw_cross(&im, 10, 10, 4, 1, WHITE, 1); /* 9 + 4 + 4 pixels, centre counted once */
-    CHECK_NEAR(ink(&im), 17, 1e-5);
+    plx_draw_cross(&im, 10, 10, 4, 1, WHITE, 1); /* area: 8 x 1 bar + two 3.5 x 1 arms */
+    CHECK_NEAR(ink(&im), 15, 1e-5);
+    CHECK(PLX_PX(&im, 10, 10, 0) == 1 && PLX_PX(&im, 10, 7, 0) == 1 && PLX_PX(&im, 6, 10, 0) == 0.5f);
     plx_draw_rect_outline(&im, 0, 0, 19, 19, 1, WHITE, 0.5f); /* edge pixels half-covered */
     plx_draw_line(&im, -50, -50, 100, 70, 3, WHITE, 1);        /* clipping */
     plx_draw_disc(&im, NAN, 3, 4, WHITE, 1);                    /* rejected, no crash */
     plx_img_free(&im);
 
     im = plx_img_new(12, 12, 3);
-    plx_draw_rect_outline(&im, 2, 2, 9, 9, 1, WHITE, 1); /* ring of pixel width: 4 * 7 (half-covered rims) */
-    CHECK_NEAR(ink(&im), 4 * 8 * 1.0, 1e-4);
+    plx_draw_rect_outline(&im, 2, 2, 9, 9, 1, WHITE, 1); /* 1 px ring centred on pixel centres: 4 x 7 */
+    CHECK_NEAR(ink(&im), 28, 1e-4);
+    CHECK(PLX_PX(&im, 2, 2, 0) == 1 && PLX_PX(&im, 9, 5, 0) == 1 && PLX_PX(&im, 5, 5, 0) == 0);
     plx_img_free(&im);
 }
 
@@ -406,6 +408,7 @@ TEST(raster_hemisphere_yaw_shift_and_self_occlusion) {
     plx_mesh m = plx_mesh_heightfield(&z, NULL, NULL);
     double c[3] = {50, 50, 0};
     int lo[2], hi[2], hidden_wrong[2] = {0, 0}, visible_wrong[2] = {0, 0};
+    double vmin[2], vmax[2];
     plx_raster rr[2];
     for (int s = 0; s < 2; s++) {
         double yaw = (s ? -30 : 30) * DEG;
@@ -415,13 +418,18 @@ TEST(raster_hemisphere_yaw_shift_and_self_occlusion) {
         lo[s] = HEMI_N; hi[s] = -1;
         for (int x = 0; x < HEMI_N; x++)
             if (rr[s].mask[50 * HEMI_N + x]) { lo[s] = PLX_MIN(lo[s], x); hi[s] = PLX_MAX(hi[s], x); }
-        /* Equator vertices: visible iff their projected depth reaches the z-buffer. */
-        for (int x = 10; x <= 90; x++) {
+        /* Equator vertices: visible iff their depth reaches the z-buffer at the nearest pixel.
+         * The tolerance covers half a pixel of the steepest visible slope (~5 near the rim);
+         * occluded vertices sit more than 10 behind the front surface. */
+        vmin[s] = 1e9; vmax[s] = -1e9;
+        for (int x = 11; x <= 89; x++) {
             double p[3];
             plx_camera_project(&cam, m.v + 3 * (50 * HEMI_N + x), p);
+            vmin[s] = fmin(vmin[s], p[0]);
+            vmax[s] = fmax(vmax[s], p[0]);
             int px = (int)lround(p[0]);
             float d = PLX_PX(&rr[s].depth, PLX_CLAMP(px, 0, HEMI_N - 1), 50, 0);
-            bool vis = !isnan(d) && p[2] >= d - 0.75;
+            bool vis = !isnan(d) && p[2] >= d - 4;
             double ox = (x - 50) * (s ? -1 : 1); /* + = the side that turns away */
             if (ox >= 37) hidden_wrong[s] += vis;  /* beyond r sin 60 = 34.6: self-occluded */
             if (ox <= 30) visible_wrong[s] += !vis;
@@ -438,9 +446,15 @@ TEST(raster_hemisphere_yaw_shift_and_self_occlusion) {
         CHECK(diff == 0);
         plx_raster_free(&keep);
     }
-    /* yaw +30: silhouette spans [50 - r cos 30, 50 + r] = [15.4, 90]; shifted towards image-right. */
-    CHECK(lo[0] >= 15 && lo[0] <= 17 && hi[0] >= 88 && hi[0] <= 90);
-    CHECK(lo[1] >= 10 && lo[1] <= 12 && hi[1] >= 83 && hi[1] <= 85); /* mirror image */
+    /* Row 50 is covered exactly between the extreme projected equator vertices (row 50 is a
+     * line of mesh edges), to within the pixel-centre rounding. For yaw +30 the far side
+     * reaches 50 + r = 90 (the sphere's own silhouette), the near rim only about
+     * 50 - 29 (the grid rim is steep, so it falls short of 50 - r cos 30): the disc has moved
+     * towards image-right. Yaw -30 is the mirror image. */
+    for (int s = 0; s < 2; s++) CHECK(lo[s] >= ceil(vmin[s]) && lo[s] <= ceil(vmin[s]) + 1 && hi[s] <= floor(vmax[s]) && hi[s] >= floor(vmax[s]) - 1);
+    CHECK(hi[0] >= 89 && hi[0] <= 90 && lo[1] >= 10 && lo[1] <= 11);
+    CHECK(0.5 * (lo[0] + hi[0]) > 54 && 0.5 * (lo[1] + hi[1]) < 46);
+    CHECK(abs((lo[0] + hi[1]) - 100) <= 1 && abs((hi[0] + lo[1]) - 100) <= 1);
     CHECK(hidden_wrong[0] == 0 && hidden_wrong[1] == 0 && visible_wrong[0] == 0 && visible_wrong[1] == 0);
     /* The two masks are mirror images (up to the triangulation's diagonal direction). */
     int mism = 0, cov = 0;
@@ -614,6 +628,7 @@ TEST(demo_pictures) {
     plx_img tiles[4];
     tiles[0] = plx_viz_scalar(&z, PLX_CMAP_SEQ);
     plx_img grad = plx_img_new(120, 150, 1), fx = plx_img_new(120, 150, 1), fy = plx_img_new(120, 150, 1);
+    for (int i = 0; i < 120 * 150; i++) grad.px[i] = fx.px[i] = fy.px[i] = NAN; /* border: no data */
     for (int y = 1; y < 149; y++)
         for (int x = 1; x < 119; x++) {
             PLX_PX(&grad, x, y, 0) = PLX_PX(&z, x + 1, y, 0) - PLX_PX(&z, x - 1, y, 0);
