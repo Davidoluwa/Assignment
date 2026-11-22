@@ -2,6 +2,8 @@
  * pair-supervised metrics on top of that embedding. */
 #include "rec/match.h"
 
+#include "rec/fuse.h"
+
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -308,8 +310,7 @@ static void pair_features(const float *u, const float *v, int mm, double *phi) {
     }
 }
 
-/* L2-regularised logistic regression by Newton's method (IRLS) on standardised pair features.
- * Objective: mean log-loss + 0.5 l2 ||w||^2 (bias unpenalised). */
+/* L2-regularised logistic regression (plx_logreg_fit) on standardised pair features. */
 static int fit_logit(plx_match_model *m, const float *y, int np, const int *pa, const int *pb, const int *same) {
     int mm = m->m, F = 2 * mm + 1, k = m->k;
     plx_mat Phi = plx_mat_new(np, F);
@@ -335,36 +336,7 @@ static int fit_logit(plx_match_model *m, const float *y, int np, const int *pa, 
         for (int p = 0; p < np; p++) PLX_M(&Phi, p, j) = (PLX_M(&Phi, p, j) - s) * m->f_scale[j];
     }
     m->w = PLX_NEW(double, F);
-    double *g = PLX_NEW(double, F);
-    plx_mat H = plx_mat_new(F, F), Pw = plx_mat_new(np, F);
-    int rc = PLX_OK;
-    for (int it = 0; it < 50; it++) {
-        memset(g, 0, sizeof(double) * F);
-        for (int p = 0; p < np; p++) {
-            double t = plx_vec_dot(&PLX_M(&Phi, p, 0), m->w, (size_t)F);
-            double pr = 1.0 / (1.0 + exp(-t));
-            double res = (pr - (same[p] != 0)) / np, sw = sqrt(pr * (1.0 - pr) / np);
-            plx_vec_axpy(g, res, &PLX_M(&Phi, p, 0), (size_t)F);
-            for (int j = 0; j < F; j++) PLX_M(&Pw, p, j) = sw * PLX_M(&Phi, p, j);
-        }
-        plx_syrk(PLX_TRANS, 1.0, &Pw, 0.0, &H);
-        for (int j = 0; j < F; j++) {
-            double l2 = j < F - 1 ? m->cfg.logit_l2 : 1e-9; /* the bias is (almost) unpenalised */
-            g[j] += l2 * m->w[j];
-            PLX_M(&H, j, j) += l2;
-        }
-        rc = plx_chol(&H);
-        if (rc != PLX_OK) {
-            plx_log("logistic regression: Hessian not SPD");
-            break;
-        }
-        plx_chol_solve_vec(&H, g);
-        plx_vec_axpy(m->w, -1.0, g, (size_t)F);
-        if (plx_vec_norm(g, (size_t)F) < 1e-9 * (1.0 + plx_vec_norm(m->w, (size_t)F))) break;
-    }
-    free(g);
-    plx_mat_free(&H);
-    plx_mat_free(&Pw);
+    int rc = plx_logreg_fit(&Phi, same, m->cfg.logit_l2, m->w);
     plx_mat_free(&Phi);
     return rc;
 }

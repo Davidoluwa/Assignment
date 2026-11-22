@@ -967,6 +967,9 @@ static int run_synth_mode(const plx_args *a) {
 
     /* base clip, with diagnostics */
     plx_fu_synth_opts o = plx_fu_synth_defaults();
+    o.shade = plx_arg_num(a, "shade", o.shade);
+    o.noise = plx_arg_num(a, "noise", o.noise);
+    o.F = (int)plx_arg_int(a, "frames", o.F);
     synth_eval ev;
     say("BASE: 40 frames, yaw +-30, nod +-12, roll +-3, 250 x 250, head 0, texture 0\n");
     eval_header();
