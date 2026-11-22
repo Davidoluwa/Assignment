@@ -1,21 +1,29 @@
-// plx-deps: rec eval data la feat ops viz img core
+// plx-deps: rec align eval data la feat ops viz img core
 /* plx_eval_tex: texture-descriptor face verification on LFW (ablation rungs L0 / L1).
  *
- *   plx_eval_tex --pack runs/main/pack [--sim runs/main/congeal/sim.plxt] --out runs/main/rec/<name>
- *                [descriptor / matcher flags] [--view2] [--ablation]
+ *   plx_eval_tex --pack runs/main/pack [--sim runs/main/congeal/sim.plxt | --flow runs/main/flow]
+ *                --out runs/main/rec/<name> [texture / descriptor / matcher flags] [--view2]
+ *                [--ablation ladder|flow]
  *
- * Without --sim every image uses the identity similarity: the raw centre crop (L0).
+ * Texture source: without --sim or --flow every image uses the identity similarity, the raw
+ * centre crop (L0); --sim is the similarity alignment (L1); --flow DIR resamples through the
+ * dense flow W(p) = T(p + alpha u(p)) with DIR's own u.plxt, sim.plxt and quality.plxt (L2).
+ * Texture flags: --alpha A (fraction of the flow applied, default 1), --jconf P (confidence *=
+ *   clamp(det(I + alpha grad u), 0, 1)^P; 0 = off), --fallback BITS (images whose flow quality
+ *   flags intersect BITS use alpha = 0), --conf FILE (f32 [N, 160, 128] confidence planes from
+ *   outside, multiplied in: the seam for depth-derived visibility), --codes FILE (f32 [N, K]
+ *   non-texture codes appended to every descriptor as one more block: the seam for geometry codes).
  * Writes into <out>:
  *   desc.plxt, cellw.plxt, desc.cfg   descriptor cache [N, D] / [N, cells] (reused when desc.cfg matches)
  *   report.txt                        configuration + plx_verif_print blocks: View 1 (and View 2
  *                                     with --view2), unsupervised and image-restricted paradigms
  *   roc_<view>_<paradigm>.csv, scores_<view>_<paradigm>.csv
- *   textures.png                      canonical textures before / after photometric normalisation
+ *   textures.png                      canonical textures, photometrically normalised, confidence
  *   fails_<view>_<paradigm>.png       most confident false matches and false rejects
- *   ablation.txt                      with --ablation (a separate mode: nothing else is run or
- *                                     written): View 1 ingredient table, View 2 untouched
+ *   ablation_<table>.txt              with --ablation (a separate mode: nothing else is run or
+ *                                     written): a View 1 table, View 2 untouched
  *
- * Descriptor flags: --blocks SPEC (see plx_desc_parse_blocks), --region x0,y0,w,h, --nosqrt, --nomirror,
+ * Descriptor flags: --blocks SPEC (see plx_desc_parse_blocks), --region x0,y0,w,h, --nosqrt, --nomirror, --mirror-weighted,
  *   --nophoto, --gamma G, --dog0 S, --dog1 S, --tau T, --ori-k K, --ori-unsigned
  * Matcher flags: --score embed|chi2|cos|cell, --pca K, --pca-n N, --global-pca, --nowhiten,
  *   --pca-iters Q, --sup lda|jb|logit, --sup-pca R, --sup-dim M, --ridge R, --l2 L
@@ -54,6 +62,7 @@ static plx_desc_params desc_from_args(const plx_args *a) {
     if (reg && sscanf(reg, "%d,%d,%d,%d", &p.x0, &p.y0, &p.w, &p.h) != 4) plx_die("bad --region (x0,y0,w,h)");
     if (plx_arg_flag(a, "nosqrt")) p.sqrt_hist = false;
     if (plx_arg_flag(a, "nomirror")) p.mirror = false;
+    if (plx_arg_flag(a, "mirror-weighted")) p.mirror_weighted = true;
     if (plx_arg_flag(a, "nophoto")) p.photo = plx_photo_none();
     p.photo.gamma = (float)plx_arg_num(a, "gamma", p.photo.gamma);
     p.photo.dog_s0 = (float)plx_arg_num(a, "dog0", p.photo.dog_s0);
@@ -102,10 +111,40 @@ static plx_match_cfg match_from_args(const plx_args *a) {
 typedef struct {
     plx_lfw db;
     plx_pairs view2, dev_train, dev_test;
-    plx_tensor gray;     /* u8 [N, 250, 250], mapped */
-    float *sim;          /* [N, 4] */
-    const char *sim_path;
+    plx_tensor gray;       /* u8 [N, 250, 250], mapped */
+    float *sim;            /* [N, 4] */
+    const char *sim_path;  /* NULL: identity */
+    float *u;              /* [N, PLX_REC_FLOW_DOF] dense flow, or NULL (rungs L0 / L1) */
+    int *qflags;           /* [N] flow quality flag bits (flow/quality.plxt column 6), or NULL */
+    const char *flow_dir;
+    plx_tensor conf;       /* optional f32 [N, 160, 128] confidence planes from outside (mapped) */
+    const char *conf_path;
+    float *codes;          /* optional f32 [N, code_dim] non-texture codes appended as one block */
+    int code_dim;
+    const char *codes_path;
 } dataset;
+
+/* How a texture is made from the data: everything per-configuration (ablation rows differ). */
+typedef struct {
+    float alpha;     /* fraction of the flow field applied */
+    float jpow;      /* > 0: confidence *= clamp(det(I + alpha grad u), 0, 1)^jpow */
+    int   fallback;  /* images whose flow quality flags intersect this mask use alpha = 0 */
+} tex_opts;
+
+static tex_opts tex_from_args(const plx_args *a) {
+    return (tex_opts){.alpha = (float)plx_arg_num(a, "alpha", 1.0), .jpow = (float)plx_arg_num(a, "jconf", 0.0),
+                      .fallback = (int)plx_arg_int(a, "fallback", 0)};
+}
+
+static float *load_f32(const char *path, int64_t rows, int64_t cols, int64_t *cols_out) {
+    plx_tensor t;
+    if (plx_tensor_load(path, &t) != PLX_OK) plx_die("cannot load %s", path);
+    int64_t c = t.ndim >= 2 ? t.nbytes / sizeof(float) / (size_t)t.dim[0] : 1;
+    if (t.dtype != PLX_F32 || t.dim[0] != rows || (cols > 0 && c != cols))
+        plx_die("%s: expected f32 [%lld, %lld]", path, (long long)rows, (long long)cols);
+    if (cols_out) *cols_out = c;
+    return t.data;
+}
 
 static void dataset_open(dataset *ds, const plx_args *a) {
     const char *lfw = plx_arg_str(a, "lfw", "data/lfw");
@@ -125,17 +164,40 @@ static void dataset_open(dataset *ds, const plx_args *a) {
     if (ds->gray.dtype != PLX_U8 || ds->gray.ndim != 3 || ds->gray.dim[0] != n || ds->gray.dim[1] != SIDE ||
         ds->gray.dim[2] != SIDE)
         plx_die("%s: expected u8 [%d, 250, 250]", path, n);
-    ds->sim = PLX_NEW(float, (size_t)n * 4);
-    ds->sim_path = plx_arg_str(a, "sim", NULL);
+
+    /* --flow DIR brings its own similarity: the fields are only meaningful with the T they were
+     * solved with */
+    ds->flow_dir = plx_arg_str(a, "flow", NULL);
+    static char flow_sim[4096];
+    if (ds->flow_dir) snprintf(flow_sim, sizeof flow_sim, "%s/sim.plxt", ds->flow_dir);
+    ds->sim_path = ds->flow_dir ? flow_sim : plx_arg_str(a, "sim", NULL);
     if (ds->sim_path) {
-        plx_tensor t;
-        if (plx_tensor_load(ds->sim_path, &t) != PLX_OK) plx_die("cannot load %s", ds->sim_path);
-        if (t.dtype != PLX_F32 || t.ndim != 2 || t.dim[0] != n || t.dim[1] != 4)
-            plx_die("%s: expected f32 [%d, 4]", ds->sim_path, n);
-        memcpy(ds->sim, t.data, sizeof(float) * (size_t)n * 4);
-        plx_tensor_free(&t);
+        ds->sim = load_f32(ds->sim_path, n, 4, NULL);
     } else {
+        ds->sim = PLX_NEW(float, (size_t)n * 4);
         for (int i = 0; i < n; i++) ds->sim[4 * i] = 1.0f; /* identity: raw centre crop */
+    }
+    if (ds->flow_dir) {
+        snprintf(path, sizeof path, "%s/u.plxt", ds->flow_dir);
+        ds->u = load_f32(path, n, PLX_REC_FLOW_DOF, NULL);
+        snprintf(path, sizeof path, "%s/quality.plxt", ds->flow_dir);
+        float *q = load_f32(path, n, 7, NULL);
+        ds->qflags = PLX_NEW(int, n);
+        for (int i = 0; i < n; i++) ds->qflags[i] = (int)q[7 * (size_t)i + 6];
+        free(q);
+    }
+    ds->conf_path = plx_arg_str(a, "conf", NULL);
+    if (ds->conf_path) {
+        if (plx_tensor_map(ds->conf_path, &ds->conf) != PLX_OK) plx_die("cannot map %s", ds->conf_path);
+        if (ds->conf.dtype != PLX_F32 || ds->conf.ndim != 3 || ds->conf.dim[0] != n ||
+            ds->conf.dim[1] != PLX_REC_TEX_H || ds->conf.dim[2] != PLX_REC_TEX_W)
+            plx_die("%s: expected f32 [%d, %d, %d]", ds->conf_path, n, PLX_REC_TEX_H, PLX_REC_TEX_W);
+    }
+    ds->codes_path = plx_arg_str(a, "codes", NULL);
+    if (ds->codes_path) {
+        int64_t dim;
+        ds->codes = load_f32(ds->codes_path, n, -1, &dim);
+        ds->code_dim = (int)dim;
     }
 }
 
@@ -144,23 +206,53 @@ static void dataset_close(dataset *ds) {
     plx_pairs_free(&ds->dev_train);
     plx_pairs_free(&ds->dev_test);
     plx_tensor_free(&ds->gray);
+    if (ds->conf_path) plx_tensor_free(&ds->conf);
     free(ds->sim);
+    free(ds->u);
+    free(ds->qflags);
+    free(ds->codes);
     plx_lfw_free(&ds->db);
 }
 
-/* The texture source of rungs L0 / L1. Later rungs replace exactly this function. */
-static void texture_of(const dataset *ds, int i, plx_img *tex, plx_img *conf) {
+/* The texture source: L0 / L1 resample through the similarity, L2 through the dense flow. The
+ * confidence plane is the in-image mask times, optionally, the flow's stretch confidence and a
+ * plane supplied from outside (the seam for depth-derived visibility). */
+static void texture_of(const dataset *ds, const tex_opts *to, int i, plx_img *tex, plx_img *conf) {
     const uint8_t *g = (const uint8_t *)ds->gray.data + (size_t)i * PIXELS;
     plx_img im = plx_img_from_u8(g, SIDE, SIDE, 1, 1.0f / 255.0f);
-    plx_rec_texture_sim(&im, ds->sim + 4 * (size_t)i, tex, conf);
+    const float *sim = ds->sim + 4 * (size_t)i;
+    if (ds->u) {
+        const float *u = ds->u + (size_t)i * PLX_REC_FLOW_DOF;
+        float alpha = ds->qflags[i] & to->fallback ? 0.0f : to->alpha;
+        plx_rec_texture_flow(&im, sim, u, alpha, tex, conf);
+        if (to->jpow > 0.0f && alpha > 0.0f) {
+            plx_img jdet = plx_img_new(PLX_REC_TEX_W, PLX_REC_TEX_H, 1);
+            plx_rec_flow_jdet(u, alpha, &jdet);
+            plx_rec_conf_from_jdet(&jdet, to->jpow, conf);
+            plx_img_free(&jdet);
+        }
+    } else {
+        plx_rec_texture_sim(&im, sim, tex, conf);
+    }
+    if (ds->conf_path) {
+        const float *c = (const float *)ds->conf.data + (size_t)i * PLX_REC_TEX_W * PLX_REC_TEX_H;
+        for (size_t k = 0; k < (size_t)PLX_REC_TEX_W * PLX_REC_TEX_H; k++) conf->px[k] *= PLX_CLAMP(c[k], 0.0f, 1.0f);
+    }
     plx_img_free(&im);
 }
 
 /* ---- descriptors ------------------------------------------------------------------------- */
 
+static plx_desc_layout layout_of(const dataset *ds, const plx_desc_params *p) {
+    plx_desc_layout L = plx_desc_layout_of(p);
+    if (ds->codes) plx_desc_layout_append_code(&L, ds->code_dim);
+    return L;
+}
+
 typedef struct {
     const dataset *ds;
     const plx_desc_params *p;
+    const tex_opts *to;
     plx_desc_layout lay;
     float *x, *cw;
 } desc_job;
@@ -168,17 +260,29 @@ typedef struct {
 static void desc_one(int64_t i, int tid, void *ctx) {
     desc_job *j = ctx;
     plx_img tex = plx_img_new(PLX_REC_TEX_W, PLX_REC_TEX_H, 1), conf = plx_img_new(PLX_REC_TEX_W, PLX_REC_TEX_H, 1);
-    texture_of(j->ds, (int)i, &tex, &conf);
-    plx_desc_compute(j->p, &tex, &conf, j->x + (size_t)i * j->lay.d, j->cw + (size_t)i * j->lay.n_cells);
+    texture_of(j->ds, j->to, (int)i, &tex, &conf);
+    float *x = j->x + (size_t)i * j->lay.d, *cw = j->cw + (size_t)i * j->lay.n_cells;
+    plx_desc_compute(j->p, &tex, &conf, x, cw);
+    if (j->ds->codes) { /* the code block sits last, with full confidence */
+        int cb = j->lay.n_blocks - 1;
+        memcpy(x + j->lay.off[cb], j->ds->codes + (size_t)i * j->ds->code_dim, sizeof(float) * j->ds->code_dim);
+        cw[j->lay.cell_off[cb]] = 1.0f;
+    }
     plx_img_free(&tex);
     plx_img_free(&conf);
 }
 
 /* desc.cfg holds the descriptor description and the texture source; equal text = reusable cache */
-static void cache_key(const dataset *ds, const plx_desc_params *p, char *buf, size_t cap) {
+static void cache_key(const dataset *ds, const plx_desc_params *p, const tex_opts *to, char *buf, size_t cap) {
     char d[1024];
     plx_desc_describe(p, d, sizeof d);
-    snprintf(buf, cap, "%s sim=%s\n", d, ds->sim_path ? ds->sim_path : "identity");
+    int at = snprintf(buf, cap, "%s sim=%s", d, ds->sim_path ? ds->sim_path : "identity");
+    if (ds->flow_dir && at > 0 && (size_t)at < cap)
+        at += snprintf(buf + at, cap - (size_t)at, " flow=%s alpha=%g jconf=%g fallback=%d", ds->flow_dir, to->alpha,
+                       to->jpow, to->fallback);
+    if (ds->conf_path && at > 0 && (size_t)at < cap) at += snprintf(buf + at, cap - (size_t)at, " conf=%s", ds->conf_path);
+    if (ds->codes_path && at > 0 && (size_t)at < cap) at += snprintf(buf + at, cap - (size_t)at, " codes=%s", ds->codes_path);
+    if (at > 0 && (size_t)at < cap) snprintf(buf + at, cap - (size_t)at, "\n");
 }
 
 static bool cache_load(const char *out, const char *key, const plx_desc_layout *lay, int n, float **x, float **cw) {
@@ -210,17 +314,17 @@ static bool cache_load(const char *out, const char *key, const plx_desc_layout *
     return ok;
 }
 
-static void descriptors(const dataset *ds, const plx_desc_params *p, const char *out, bool use_cache, float **x,
-                        float **cw) {
-    plx_desc_layout lay = plx_desc_layout_of(p);
+static void descriptors(const dataset *ds, const plx_desc_params *p, const tex_opts *to, const char *out,
+                        bool use_cache, float **x, float **cw) {
+    plx_desc_layout lay = layout_of(ds, p);
     int n = ds->db.n_images;
-    char key[1200];
-    cache_key(ds, p, key, sizeof key);
+    char key[2048];
+    cache_key(ds, p, to, key, sizeof key);
     if (use_cache && cache_load(out, key, &lay, n, x, cw)) {
         plx_log("descriptor cache hit: %d x %d", n, lay.d);
         return;
     }
-    desc_job j = {.ds = ds, .p = p, .lay = lay, .x = plx_malloc(sizeof(float) * (size_t)n * lay.d),
+    desc_job j = {.ds = ds, .p = p, .to = to, .lay = lay, .x = plx_malloc(sizeof(float) * (size_t)n * lay.d),
                   .cw = plx_malloc(sizeof(float) * (size_t)n * lay.n_cells)};
     double t0 = plx_now();
     plx_parallel_for(n, 16, desc_one, &j);
@@ -259,45 +363,45 @@ static plx_img display_norm(const plx_img *v) {
     return d;
 }
 
-static void texture_montage(const dataset *ds, const plx_desc_params *p, const char *out) {
-    enum { NIMG = 12 };
-    plx_img tiles[2 * NIMG];
-    char lab[2 * NIMG][32];
-    const char *labels[2 * NIMG];
+static void texture_montage(const dataset *ds, const plx_desc_params *p, const tex_opts *to, const char *out) {
+    enum { NIMG = 12, PER = 3 };
+    plx_img tiles[PER * NIMG];
+    char lab[PER * NIMG][32];
+    const char *labels[PER * NIMG];
     for (int t = 0; t < NIMG; t++) {
         /* spread over the dev-test pairs: a mix of people, lighting and pose */
         const plx_pair *pr = &ds->dev_test.p[(size_t)t * ds->dev_test.n / NIMG];
         int img = t % 2 ? pr->b : pr->a;
         plx_img tex = plx_img_new(PLX_REC_TEX_W, PLX_REC_TEX_H, 1), conf = plx_img_new(PLX_REC_TEX_W, PLX_REC_TEX_H, 1);
-        texture_of(ds, img, &tex, &conf);
+        texture_of(ds, to, img, &tex, &conf);
         plx_img norm = plx_img_clone(&tex);
         plx_photo_normalize(&norm, &conf, &p->photo);
-        tiles[2 * t] = tex;
-        tiles[2 * t + 1] = display_norm(&norm);
+        tiles[PER * t] = tex;
+        tiles[PER * t + 1] = display_norm(&norm);
+        tiles[PER * t + 2] = conf; /* [0, 1] already: black = no evidence */
         plx_img_free(&norm);
-        plx_img_free(&conf);
-        snprintf(lab[2 * t], sizeof lab[0], "#%d raw", img);
-        snprintf(lab[2 * t + 1], sizeof lab[0], "normalised");
-        labels[2 * t] = lab[2 * t];
-        labels[2 * t + 1] = lab[2 * t + 1];
+        snprintf(lab[PER * t], sizeof lab[0], "#%d raw", img);
+        snprintf(lab[PER * t + 1], sizeof lab[0], "normalised");
+        snprintf(lab[PER * t + 2], sizeof lab[0], "confidence");
+        for (int k = 0; k < PER; k++) labels[PER * t + k] = lab[PER * t + k];
     }
     plx_montage_opts o = plx_montage_defaults();
-    o.cols = 8;
-    plx_img m = plx_viz_montage(tiles, 2 * NIMG, labels, &o);
+    o.cols = 3 * PER;
+    plx_img m = plx_viz_montage(tiles, PER * NIMG, labels, &o);
     plx_img big = plx_viz_upscale(&m, 2, PLX_UP_NEAREST);
     save_png(out, "textures.png", &big);
     plx_img_free(&m);
     plx_img_free(&big);
-    for (int t = 0; t < 2 * NIMG; t++) plx_img_free(&tiles[t]);
+    for (int t = 0; t < PER * NIMG; t++) plx_img_free(&tiles[t]);
 }
 
 /* the two canonical textures side by side, with the descriptor region outlined */
-static plx_img pair_tile(const dataset *ds, const plx_desc_params *p, int a, int b) {
+static plx_img pair_tile(const dataset *ds, const plx_desc_params *p, const tex_opts *to, int a, int b) {
     plx_img tile = plx_img_new(2 * PLX_REC_TEX_W + 4, PLX_REC_TEX_H, 3);
     plx_img tex = plx_img_new(PLX_REC_TEX_W, PLX_REC_TEX_H, 1), conf = plx_img_new(PLX_REC_TEX_W, PLX_REC_TEX_H, 1);
     const float red[3] = {0.9f, 0.3f, 0.2f};
     for (int s = 0; s < 2; s++) {
-        texture_of(ds, s ? b : a, &tex, &conf);
+        texture_of(ds, to, s ? b : a, &tex, &conf);
         int ox = s * (PLX_REC_TEX_W + 4);
         for (int k = 0; k < 3; k++)
             for (int y = 0; y < PLX_REC_TEX_H; y++)
@@ -318,7 +422,7 @@ static int ranked_desc(const void *x, const void *y) {
 
 /* Most confident errors: largest |score - threshold| on the wrong side. thr(i) is the threshold
  * the protocol applied to pair i. Top rows false matches, bottom rows false rejects. */
-static void failure_montage(const dataset *ds, const plx_desc_params *p, const plx_pair *pr, int n,
+static void failure_montage(const dataset *ds, const plx_desc_params *p, const tex_opts *to, const plx_pair *pr, int n,
                             const double *score, const double *thr, const char *out, const char *name) {
     enum { SHOW = 8 };
     ranked *fm = PLX_NEW(ranked, n), *fr = PLX_NEW(ranked, n);
@@ -339,7 +443,7 @@ static void failure_montage(const dataset *ds, const plx_desc_params *p, const p
         int cnt = PLX_MIN(SHOW, s ? nfr : nfm);
         for (int t = 0; t < cnt; t++) {
             const plx_pair *q = &pr[r[t].i];
-            tiles[nt] = pair_tile(ds, p, q->a, q->b);
+            tiles[nt] = pair_tile(ds, p, to, q->a, q->b);
             char na[24], nb[24];
             snprintf(na, sizeof na, "%.20s", ds->db.id_name[ds->db.img_id[q->a]]);
             snprintf(nb, sizeof nb, "%.20s", ds->db.id_name[ds->db.img_id[q->b]]);
@@ -368,6 +472,7 @@ static void failure_montage(const dataset *ds, const plx_desc_params *p, const p
 typedef struct {
     const dataset *ds;
     const plx_desc_params *dp;
+    const tex_opts *to;
     plx_desc_layout lay;
     plx_feats all;
     const char *out;
@@ -387,7 +492,7 @@ static void write_outputs(const evaluator *ev, const char *view, int par, const 
     if (ev->png) {
         char name[64];
         snprintf(name, sizeof name, "fails_%s_%s.png", view, PAR_NAME[par]);
-        failure_montage(ev->ds, ev->dp, p, n, score, thr, ev->out, name);
+        failure_montage(ev->ds, ev->dp, ev->to, p, n, score, thr, ev->out, name);
     }
 }
 
@@ -426,9 +531,15 @@ static void run_view(const evaluator *ev, const plx_match_cfg *cfg, bool view2) 
 }
 
 /* ---- ablation ----------------------------------------------------------------------------
- * View 1 only (View 2 is never touched here). Each row is a set of flags applied to the built-in
- * defaults, exactly as on the command line; rows are cumulative where the label says "+". */
-static const char *const ABLATION[][2] = {
+ * View 1 only (View 2 is never touched here). Each row's flags are appended to the command
+ * line's (later flags win), so a table runs on top of whatever configuration the command line
+ * sets; rows are cumulative where the label says "+".
+ *   ladder  the ingredient table of rungs L0 / L1 (descriptor and matcher ingredients)
+ *   flow    the L2 experiments: partial warps, the stretch confidence plane and the ways of
+ *           using it, and flow-quality fallback (needs --flow) */
+typedef struct { const char *label, *flags; } ablation_row;
+
+static const ablation_row LADDER[] = {
     {"LBP(8,1) 8px cells, raw hist, chi-square", "--blocks lbp1:8 --nophoto --nosqrt --nomirror --score chi2"},
     {"+ photometric normalisation", "--blocks lbp1:8 --nosqrt --nomirror --score chi2"},
     {"+ Hellinger (sqrt), raw cosine", "--blocks lbp1:8 --nomirror --score cos"},
@@ -453,47 +564,79 @@ static const char *const ABLATION[][2] = {
     {"joint Bayes without mirror pooling", "--nomirror --sup jb"},
 };
 
-static void ablation(const dataset *ds, const char *out) {
+/* flow quality flag bits (align/flow.h, plx_flow): 1 untrusted by congealing, 2 fold,
+ * 4 last round not converged, 8 valid < 0.9, 16 step > 1 px */
+static const ablation_row FLOW[] = {
+    {"alpha 0 (flow stage's similarity only)", "--sup jb --alpha 0"},
+    {"alpha 0.25", "--sup jb --alpha 0.25"},
+    {"alpha 0.5", "--sup jb --alpha 0.5"},
+    {"alpha 0.75", "--sup jb --alpha 0.75"},
+    {"alpha 1 (full frontalisation)", "--sup jb --alpha 1"},
+    {"+ stretch confidence p=1, impute toward mean", "--sup jb --alpha 1 --jconf 1"},
+    {"  same, p=2", "--sup jb --alpha 1 --jconf 2"},
+    {"  same, p=0.5", "--sup jb --alpha 1 --jconf 0.5"},
+    {"+ stretch p=1, weighted mirror pooling", "--sup jb --alpha 1 --jconf 1 --mirror-weighted"},
+    {"  same, p=2", "--sup jb --alpha 1 --jconf 2 --mirror-weighted"},
+    {"  same, p=4", "--sup jb --alpha 1 --jconf 4 --mirror-weighted"},
+    {"alpha 1, quality fallback fold|valid|step", "--sup jb --alpha 1 --fallback 26"},
+    {"alpha 1, fallback also untrusted-by-congeal", "--sup jb --alpha 1 --fallback 27"},
+};
+
+static void ablation(const dataset *ds, const plx_args *cmd, const char *table, const char *out) {
+    const ablation_row *rows = LADDER;
+    size_t nrows = sizeof LADDER / sizeof LADDER[0];
+    if (!strcmp(table, "flow")) {
+        if (!ds->u) plx_die("--ablation flow needs --flow");
+        rows = FLOW;
+        nrows = sizeof FLOW / sizeof FLOW[0];
+    } else if (strcmp(table, "ladder") != 0) {
+        plx_die("--ablation: unknown table '%s' (ladder | flow)", table);
+    }
     char path[4096];
-    snprintf(path, sizeof path, "%s/ablation.txt", out);
+    snprintf(path, sizeof path, "%s/ablation_%s.txt", out, table);
     FILE *f = fopen(path, "w");
     if (!f) plx_die("cannot write %s", path);
-    fprintf(f, "# View 1 ingredient table (train pairsDevTrain, test pairsDevTest), texture: %s\n",
-            ds->sim_path ? ds->sim_path : "identity (L0)");
-    fprintf(f, "# %-44s %-17s %-17s  flags\n", "configuration", "unsup acc / AUC", "restr. acc / AUC");
+    fprintf(f, "# View 1 ablation '%s' (train pairsDevTrain, test pairsDevTest), texture: %s%s%s\n# command line:", table,
+            ds->sim_path ? ds->sim_path : "identity (L0)", ds->flow_dir ? " + flow " : "",
+            ds->flow_dir ? ds->flow_dir : "");
+    for (int k = 1; k < cmd->argc; k++) fprintf(f, " %s", cmd->argv[k]);
+    fprintf(f, "\n# %-50s %-17s %-17s  flags\n", "configuration", "unsup acc / AUC", "restr. acc / AUC");
     float *x = NULL, *cw = NULL;
-    char have[1200] = "";
-    for (size_t r = 0; r < sizeof ABLATION / sizeof ABLATION[0]; r++) {
-        char buf[512], *argv[32] = {"ablation"};
-        int argc = 1;
-        snprintf(buf, sizeof buf, "%s", ABLATION[r][1]);
-        for (char *t = strtok(buf, " "); t && argc < 32; t = strtok(NULL, " ")) argv[argc++] = t;
+    char have[2048] = "";
+    for (size_t r = 0; r < nrows; r++) {
+        enum { MAXARG = 128 };
+        char buf[512], *argv[MAXARG];
+        int argc = 0;
+        for (int k = 0; k < cmd->argc && argc < MAXARG; k++) argv[argc++] = cmd->argv[k];
+        snprintf(buf, sizeof buf, "%s", rows[r].flags);
+        for (char *t = strtok(buf, " "); t && argc < MAXARG; t = strtok(NULL, " ")) argv[argc++] = t;
         plx_args a = {argc, argv};
         plx_desc_params dp = desc_from_args(&a);
         plx_match_cfg mc = match_from_args(&a);
+        tex_opts to = tex_from_args(&a);
         bool sup = plx_arg_str(&a, "sup", NULL) != NULL;
         if (!sup) mc.sup = PLX_SUP_NONE;
-        char key[1200];
-        cache_key(ds, &dp, key, sizeof key);
+        char key[2048];
+        cache_key(ds, &dp, &to, key, sizeof key);
         if (strcmp(key, have) != 0) {
             free(x);
             free(cw);
-            descriptors(ds, &dp, out, false, &x, &cw);
+            descriptors(ds, &dp, &to, out, false, &x, &cw);
             snprintf(have, sizeof have, "%s", key);
         }
-        plx_desc_layout lay = plx_desc_layout_of(&dp);
+        plx_desc_layout lay = layout_of(ds, &dp);
         plx_feats all = {.n = ds->db.n_images, .d = lay.d, .n_cells = lay.n_cells, .x = x, .cw = cw};
         double *score[2] = {PLX_NEW(double, ds->dev_test.n), sup ? PLX_NEW(double, ds->dev_test.n) : NULL};
         plx_verif_report rep[2];
         int rc = plx_rec_eval_view1(&mc, &lay, &all, &ds->dev_train, &ds->dev_test, &ds->db, score[0], score[1],
                                     &rep[0], &rep[1]);
         if (rc != PLX_OK) plx_die("ablation row %zu failed", r);
-        fprintf(f, "%-46s %.4f / %.4f   ", ABLATION[r][0], rep[0].mean_acc, rep[0].auc);
+        fprintf(f, "%-52s %.4f / %.4f   ", rows[r].label, rep[0].mean_acc, rep[0].auc);
         if (sup) fprintf(f, "%.4f / %.4f   ", rep[1].mean_acc, rep[1].auc);
         else fprintf(f, "%-17s  ", "-");
-        fprintf(f, "%s\n", ABLATION[r][1][0] ? ABLATION[r][1] : "(defaults)");
+        fprintf(f, "%s\n", rows[r].flags[0] ? rows[r].flags : "(command line only)");
         fflush(f);
-        plx_log("ablation %zu: %s  unsup %.4f", r, ABLATION[r][0], rep[0].mean_acc);
+        plx_log("ablation %zu: %s  unsup %.4f", r, rows[r].label, rep[0].mean_acc);
         free(score[0]);
         free(score[1]);
     }
@@ -512,30 +655,33 @@ int main(int argc, char **argv) {
 
     dataset ds = {0};
     dataset_open(&ds, &a);
-    if (plx_arg_flag(&a, "ablation")) { /* a mode of its own: leaves report.txt and the cache alone */
-        ablation(&ds, out);
+    const char *table = plx_arg_str(&a, "ablation", NULL);
+    if (table || plx_arg_flag(&a, "ablation")) { /* a mode of its own: leaves report.txt and the cache alone */
+        ablation(&ds, &a, table ? table : "ladder", out);
         dataset_close(&ds);
         return 0;
     }
     plx_desc_params dp = desc_from_args(&a);
     plx_match_cfg mc = match_from_args(&a);
+    tex_opts to = tex_from_args(&a);
 
     float *x = NULL, *cw = NULL;
-    descriptors(&ds, &dp, out, true, &x, &cw);
-    plx_desc_layout lay = plx_desc_layout_of(&dp);
+    descriptors(&ds, &dp, &to, out, true, &x, &cw);
+    plx_desc_layout lay = layout_of(&ds, &dp);
 
     char path[4096];
     snprintf(path, sizeof path, "%s/report.txt", out);
     FILE *rep = fopen(path, "w");
     if (!rep) plx_die("cannot write %s", path);
-    char ddesc[1024];
-    plx_desc_describe(&dp, ddesc, sizeof ddesc);
-    fprintf(rep, "plx_eval_tex report\n# texture: %s\n# descriptor: %s  (D = %d, %d cells)\n\n",
-            ds.sim_path ? ds.sim_path : "identity similarity (raw centre crop, L0)", ddesc, lay.d, lay.n_cells);
+    char key[2048];
+    cache_key(&ds, &dp, &to, key, sizeof key);
+    fprintf(rep, "plx_eval_tex report\n# texture: %s\n# descriptor + texture source: %s# D = %d, %d cells\n\n",
+            ds.flow_dir ? "dense flow (L2)" : ds.sim_path ? "similarity (L1)" : "identity similarity (raw centre crop, L0)",
+            key, lay.d, lay.n_cells);
 
-    evaluator ev = {.ds = &ds, .dp = &dp, .lay = lay, .all = {.n = ds.db.n_images, .d = lay.d, .n_cells = lay.n_cells,
+    evaluator ev = {.ds = &ds, .dp = &dp, .to = &to, .lay = lay, .all = {.n = ds.db.n_images, .d = lay.d, .n_cells = lay.n_cells,
                     .x = x, .cw = cw}, .out = out, .report = rep, .png = !plx_arg_flag(&a, "no-png")};
-    if (ev.png) texture_montage(&ds, &dp, out);
+    if (ev.png) texture_montage(&ds, &dp, &to, out);
 
     run_view(&ev, &mc, false);
     if (plx_arg_flag(&a, "view2")) run_view(&ev, &mc, true);

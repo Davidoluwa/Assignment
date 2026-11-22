@@ -1,4 +1,4 @@
-// plx-deps: rec eval data la feat ops img core
+// plx-deps: rec align eval data la feat ops img core
 #include "test.h"
 
 #include "core/core.h"
@@ -96,6 +96,64 @@ TEST(identity_texture_is_centre_crop) {
     plx_img_free(&g);
     plx_img_free(&tex);
     plx_img_free(&conf);
+}
+
+/* ---- flow texture and stretch confidence ---------------------------------------------- */
+
+/* u(p) = M (p - c0) + t on the 8-px lattice: affine fields are exactly representable */
+static void affine_field(const double M[4], double tx, double ty, float *u) {
+    for (int i = 0; i < 21; i++)
+        for (int j = 0; j < 17; j++) {
+            double x = -0.5 + 8 * j - PLX_REC_C0X, y = -0.5 + 8 * i - PLX_REC_C0Y;
+            u[i * 17 + j] = (float)(M[0] * x + M[1] * y + tx);
+            u[357 + i * 17 + j] = (float)(M[2] * x + M[3] * y + ty);
+        }
+}
+
+TEST(flow_texture_and_jacobian) {
+    plx_img g = textured(250, 250, 6);
+    plx_img t0 = plx_img_new(PLX_REC_TEX_W, PLX_REC_TEX_H, 1), c0 = plx_img_new(PLX_REC_TEX_W, PLX_REC_TEX_H, 1);
+    plx_img t1 = plx_img_new(PLX_REC_TEX_W, PLX_REC_TEX_H, 1), c1 = plx_img_new(PLX_REC_TEX_W, PLX_REC_TEX_H, 1);
+    const float sim[4] = {1.05f, 0.08f, 2.0f, -3.0f};
+    float u[PLX_REC_FLOW_DOF];
+    const double M[4] = {-0.2, 0.05, 0.1, 0.15};
+    affine_field(M, 1.5, -2.0, u);
+    /* alpha = 0 is the similarity texture */
+    plx_rec_texture_sim(&g, sim, &t0, &c0);
+    plx_rec_texture_flow(&g, sim, u, 0.0f, &t1, &c1);
+    CHECK(plx_img_max_abs_diff(&t0, &t1) < 1e-4f);
+    /* a pure translation field is the similarity with shifted t: same texture */
+    affine_field((const double[4]){0, 0, 0, 0}, 3.0, -2.0, u);
+    plx_rec_texture_flow(&g, sim, u, 1.0f, &t1, &c1);
+    const float sim2[4] = {sim[0], sim[1], sim[2] + sim[0] * 3.0f + sim[1] * 2.0f, sim[3] + sim[1] * 3.0f - sim[0] * 2.0f};
+    plx_rec_texture_sim(&g, sim2, &t0, &c0);
+    CHECK(plx_img_max_abs_diff(&t0, &t1) < 1e-3f);
+    /* Jacobian determinant of an affine field: det(I + alpha M) everywhere */
+    affine_field(M, 1.5, -2.0, u);
+    plx_img jd = plx_img_new(PLX_REC_TEX_W, PLX_REC_TEX_H, 1);
+    plx_rec_flow_jdet(u, 0.5f, &jd);
+    double want = (1 + 0.5 * M[0]) * (1 + 0.5 * M[3]) - 0.25 * M[1] * M[2];
+    float jmin = 1e9f, jmax = -1e9f;
+    for (size_t k = 0; k < (size_t)jd.w * jd.h; k++) {
+        jmin = fminf(jmin, jd.px[k]);
+        jmax = fmaxf(jmax, jd.px[k]);
+    }
+    CHECK_NEAR(jmin, want, 1e-4);
+    CHECK_NEAR(jmax, want, 1e-4);
+    /* confidence: stretch (det < 1) lowers it, compression (det > 1) does not raise it */
+    plx_img_fill(&c1, 1.0f);
+    plx_rec_conf_from_jdet(&jd, 2.0f, &c1);
+    CHECK_NEAR(c1.px[0], want * want, 1e-4);
+    plx_img_fill(&jd, 1.3f);
+    plx_img_fill(&c1, 0.8f);
+    plx_rec_conf_from_jdet(&jd, 1.0f, &c1);
+    CHECK_NEAR(c1.px[0], 0.8, 1e-6);
+    plx_img_free(&g);
+    plx_img_free(&t0);
+    plx_img_free(&c0);
+    plx_img_free(&t1);
+    plx_img_free(&c1);
+    plx_img_free(&jd);
 }
 
 /* ---- photometric / descriptor invariances -------------------------------------------- */
@@ -224,6 +282,60 @@ TEST(mirror_pooling_is_mirror_invariant) {
     free(d1);
     plx_img_free(&t);
     plx_img_free(&f);
+}
+
+TEST(weighted_mirror_pooling) {
+    plx_img t = textured(PLX_REC_TEX_W, PLX_REC_TEX_H, 7), conf = plx_img_new(PLX_REC_TEX_W, PLX_REC_TEX_H, 1);
+    plx_desc_params p = params_with("lbp1:12,ori:12");
+    p.mirror = true;
+    plx_desc_layout L = plx_desc_layout_of(&p);
+    float *d0 = PLX_NEW(float, L.d), *d1 = PLX_NEW(float, L.d), *w0 = PLX_NEW(float, L.n_cells),
+          *w1 = PLX_NEW(float, L.n_cells);
+    /* uniform confidence: weighted pooling is plain pooling */
+    plx_desc_compute(&p, &t, NULL, d0, w0);
+    p.mirror_weighted = true;
+    plx_desc_compute(&p, &t, NULL, d1, w1);
+    CHECK(max_diff(d0, d1, L.d) < 1e-6f);
+    /* left half (x < 64) unseen: every pooled cell comes from the visible right-half twin, so the
+     * descriptor ignores the left half and every cell keeps full weight */
+    for (int y = 0; y < PLX_REC_TEX_H; y++)
+        for (int x = 0; x < PLX_REC_TEX_W; x++) PLX_PX(&conf, x, y, 0) = x < 64 ? 0.0f : 1.0f;
+    plx_img t2 = plx_img_clone(&t);
+    for (int y = 0; y < PLX_REC_TEX_H; y++)
+        for (int x = 0; x < 64; x++) PLX_PX(&t2, x, y, 0) = 0.2f + 0.6f * PLX_PX(&t2, x, y, 0) * PLX_PX(&t2, x, y, 0);
+    plx_desc_compute(&p, &t, &conf, d0, w0);
+    plx_desc_compute(&p, &t2, &conf, d1, w1);
+    /* cells straddling the axis mix both halves; compare only the LBP cells wholly away from it
+     * (LBP reach and DoG blur stay within 8 px; the orientation channels' normalisation reaches
+     * further, so their cells are not compared) */
+    double worst = 0;
+    int compared = 0;
+    for (int c = 0; c < L.cells_x[0] * L.cells_y[0]; c++) {
+        int cx = c % L.cells_x[0];
+        int xa = p.x0 + cx * p.w / L.cells_x[0], xb = p.x0 + (cx + 1) * p.w / L.cells_x[0];
+        if (xb > 64 - 10 && xa < 64 + 10) continue;
+        compared++;
+        worst = fmax(worst, max_diff(d0 + c * 59, d1 + c * 59, 59));
+        CHECK(w0[c] == 1.0f);
+    }
+    CHECK(compared > 0);
+    CHECK(worst == 0.0);
+    free(d0);
+    free(d1);
+    free(w0);
+    free(w1);
+    plx_img_free(&t);
+    plx_img_free(&t2);
+    plx_img_free(&conf);
+}
+
+TEST(code_block_seam) {
+    plx_desc_params p = params_with("lbp1:12,ori:12");
+    plx_desc_layout L = plx_desc_layout_of(&p);
+    int d = L.d, nc = L.n_cells;
+    plx_desc_layout_append_code(&L, 17);
+    CHECK(L.n_blocks == 3 && L.d == d + 17 && L.n_cells == nc + 1);
+    CHECK(L.off[2] == d && L.dim[2] == 17 && L.bins[2] == 17 && L.cell_off[2] == nc);
 }
 
 TEST(block_spec_parsing) {
@@ -463,10 +575,13 @@ TEST(protocol_masks) {
 int main(void) {
     RUN(sim_affine_hand_points);
     RUN(identity_texture_is_centre_crop);
+    RUN(flow_texture_and_jacobian);
     RUN(photometric_invariances);
     RUN(descriptor_photometric_invariance);
     RUN(descriptor_weights);
     RUN(mirror_pooling_is_mirror_invariant);
+    RUN(weighted_mirror_pooling);
+    RUN(code_block_seam);
     RUN(block_spec_parsing);
     RUN(whitening_cosine_algebra);
     RUN(supervised_separates_two_gaussians);

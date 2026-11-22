@@ -8,8 +8,8 @@
  *   plx_emerge --synth [--out runs/main/geom_synth] [--n 13233] [--no-sweeps]
  *
  * Inputs (real mode): <flow>/u.plxt f32 [N, 2, 21, 17], node_weight.plxt f32 [21, 17],
- * sim.plxt f32 [N, 4], mean_face.plxt f32 [160, 128], quality.plxt f32 [N, Q] (optional; columns
- * as align/flow.h plx_fl_quality: cost, inlier, valid, step, min_jdet, max_u, converged);
+ * sim.plxt f32 [N, 4], mean_face.plxt f32 [160, 128], quality.plxt f32 [N, 7] (optional; columns
+ * as written by apps/plx_flow.c: cost, inlier, valid, min_jdet, max_u, step, flags);
  * <pack>/gray.plxt u8 [N, 250, 250]. Lattice geometry and gauge box are options, not constants:
  * --cols 17 --rows 21 --spacing 8 --x0 -0.5 --y0 -0.5 --gauge-box 23.5,103.5,23.5,135.5,
  * core ellipse --core 40,50,6 (ax, ay, yc).
@@ -962,6 +962,157 @@ static int run_synth_mode(const plx_args *a) {
     return 0;
 }
 
+/* ---- label-free reliability (real mode) ----------------------------------------------------------------- */
+/* Cosines of the principal angles between the column spans of A (d x ka) and B (d x kb), row-major. */
+static int subspace_cos(int d, const double *A, int ka, const double *B, int kb, double *cosv) {
+    int k = PLX_MIN(ka, kb);
+    if (k <= 0) return 0;
+    plx_mat Am = plx_mat_from(d, ka, A), Bm = plx_mat_from(d, kb, B), Qa = plx_mat_new(d, PLX_MIN(d, ka)),
+            Qb = plx_mat_new(d, PLX_MIN(d, kb)), Ra = plx_mat_new(PLX_MIN(d, ka), ka), Rb = plx_mat_new(PLX_MIN(d, kb), kb);
+    plx_qr(&Am, &Qa, &Ra);
+    plx_qr(&Bm, &Qb, &Rb);
+    plx_mat C = plx_mat_new(ka, kb);
+    plx_gemm(PLX_TRANS, PLX_NO_TRANS, 1, &Qa, &Qb, 0, &C);
+    double *sv = PLX_NEW(double, PLX_MIN(ka, kb));
+    PLX_ASSERT(plx_svd(&C, NULL, sv, NULL) == PLX_OK);
+    for (int j = 0; j < k; j++) cosv[j] = sv[j];
+    free(sv);
+    plx_mat_free(&Am), plx_mat_free(&Bm), plx_mat_free(&Qa), plx_mat_free(&Qb), plx_mat_free(&Ra), plx_mat_free(&Rb),
+        plx_mat_free(&C);
+    return k;
+}
+
+/* The depth basis of a fit in even core coordinates (d x kz): Uc Br. */
+static double *basis_coords(const plx_geom_model *m) {
+    int d = m->sp.ne, nr = m->nr, kz = m->kz;
+    double *B = PLX_NEW(double, (size_t)d * kz + 1);
+    for (int i = 0; i < d; i++)
+        for (int a = 0; a < kz; a++) {
+            double acc = 0;
+            for (int j = 0; j < nr; j++) acc += m->Uc[(size_t)i * nr + j] * m->Br[(size_t)j * kz + a];
+            B[(size_t)i * kz + a] = acc;
+        }
+    return B;
+}
+
+static int fit_subset(const context *cx, const float *u, const float *prior, const int *idx, int ns,
+                      const plx_emerge_opts *o0, plx_geom_model *m) {
+    int P = plx_glat_n(&cx->L);
+    float *us = PLX_NEW(float, (size_t)ns * 2 * P), *ps = PLX_NEW(float, ns);
+    for (int j = 0; j < ns; j++) {
+        memcpy(us + (size_t)j * 2 * P, u + (size_t)idx[j] * 2 * P, sizeof(float) * 2 * P);
+        ps[j] = prior[idx[j]];
+    }
+    plx_emerge_opts o = *o0;
+    o.prior_w = ps, o.boot = 50, o.n_scramble = 50;
+    int st = plx_emerge(&cx->L, us, ns, cx->node_weight, cx->core, cx->cs, &o, m);
+    free(us), free(ps);
+    return st;
+}
+
+static void compare_fits(const char *label, const plx_geom_model *a, const plx_geom_model *b) {
+    int d = a->sp.ne;
+    double vc = plx_vec_dot(a->yv, b->yv, d) / sqrt(plx_vec_dot(a->yv, a->yv, d) * plx_vec_dot(b->yv, b->yv, d));
+    say("  %-16s v corr %.4f | kappa %.3f [%.3f, %.3f] vs %.3f [%.3f, %.3f] | kappa_yaw %.3f vs %.3f, kappa_pitch %.3f vs "
+        "%.3f | K_z %d vs %d",
+        label, vc, a->kappa, a->kappa_lo, a->kappa_hi, b->kappa, b->kappa_lo, b->kappa_hi, a->kappa_yaw, b->kappa_yaw,
+        a->kappa_pitch, b->kappa_pitch, a->kz, b->kz);
+    double *A = basis_coords(a), *B = basis_coords(b), c[16];
+    int k = subspace_cos(d, A, a->kz, B, b->kz, c);
+    say(k ? "; B principal-angle cos:" : "");
+    for (int j = 0; j < k && j < 16; j++) say(" %.3f", c[j]);
+    say("\n");
+    free(A), free(B);
+}
+
+/* Nose protrusion of a depth field given at all nodes (px): max over the face-centre nodes minus the
+ * mean over the cheek nodes (|X0| in [20, 36], Y0 in [-4, 20]). */
+static double protrusion(const context *cx, const plx_gspace *sp, const double *z) {
+    double nose = -INFINITY, cs = 0;
+    int nc = 0;
+    for (int k = 0; k < sp->P; k++) {
+        if (sp->omega[k] <= 0) continue;
+        double X = plx_glat_X0(&cx->L, k), Y = plx_glat_Y0(&cx->L, k);
+        if (plx_core_centre(&cx->L, cx->cs, k)) nose = fmax(nose, z[k]);
+        if (fabs(X) >= 20 && fabs(X) <= 36 && Y >= -4 && Y <= 20) cs += z[k], nc++;
+    }
+    return nose - cs / nc;
+}
+
+static void reliability(const context *cx, const float *u, const float *prior, const plx_emerge_opts *o,
+                        const plx_geom_model *m, const plx_lfw *db, uint64_t seed) {
+    int n = m->n, *idx = PLX_NEW(int, n), *ia = PLX_NEW(int, n), *ib = PLX_NEW(int, n), na, nb;
+    plx_rng r;
+    plx_rng_seed(&r, seed);
+    say("\nSPLIT-HALF RELIABILITY (each half fitted independently, 50 bootstrap resamples for its kappa CI)\n");
+    for (int split = 0; split < 2; split++) {
+        if (split == 1 && !db) break;
+        na = nb = 0;
+        if (split == 0) {
+            for (int i = 0; i < n; i++) idx[i] = i;
+            plx_rng_shuffle(&r, idx, n);
+            for (int j = 0; j < n; j++)
+                if (j < n / 2) ia[na++] = idx[j];
+                else ib[nb++] = idx[j];
+        } else {
+            uint8_t *side = PLX_NEW(uint8_t, db->n_ids);
+            for (int k = 0; k < db->n_ids; k++) side[k] = (uint8_t)plx_rng_below(&r, 2);
+            for (int i = 0; i < n; i++)
+                if (side[db->img_id[i]]) ia[na++] = i;
+                else ib[nb++] = i;
+            free(side);
+        }
+        plx_geom_model A, B;
+        if (fit_subset(cx, u, prior, ia, na, o, &A) != PLX_OK || fit_subset(cx, u, prior, ib, nb, o, &B) != PLX_OK)
+            plx_die("split-half fit failed");
+        char lab[64];
+        snprintf(lab, sizeof lab, "%s %d/%d", split ? "by identity" : "random", na, nb);
+        compare_fits(lab, &A, &B);
+        plx_geom_model_free(&A), plx_geom_model_free(&B);
+    }
+
+    /* Does the nose depend on how turned the photos are? v regressed from the plane-gauged E of the
+     * trusted photos with |s| below / above the median only (same s, same κ, no refit). */
+    const plx_gspace *sp = &m->sp;
+    int d = sp->ne, P = sp->P, nt = 0;
+    double *as = PLX_NEW(double, n), med;
+    for (int i = 0; i < n; i++)
+        if (m->w[i] >= 0.5) as[nt++] = fabs(m->s[i]);
+    double half = 0.5;
+    quantiles(as, NULL, nt, &half, 1, &med);
+    double *num[2], den[2] = {0, 0}, *yE = PLX_NEW(double, d), *yV = PLX_NEW(double, d), *yO = PLX_NEW(double, sp->no);
+    for (int h = 0; h < 2; h++) num[h] = PLX_NEW(double, d);
+    for (int i = 0; i < n; i++) {
+        if (m->w[i] < 0.5) continue;
+        double be, ga;
+        plx_geom_measure(sp, u + (size_t)i * 2 * P, yE, yV, yO, &be, &ga);
+        int h = fabs(m->s[i]) >= med;
+        den[h] += m->w[i] * m->s[i] * m->s[i];
+        plx_vec_axpy(num[h], m->w[i] * m->s[i], yE, d);
+    }
+    say("\nNOSE vs TURN: v regressed from photos with |s| < %.3f px (median, |yaw| ~ %.1f deg) and above\n", med,
+        asin(PLX_MIN(1.0, med / m->kappa)) / DEG);
+    double *z[3];
+    for (int h = 0; h < 3; h++) {
+        z[h] = PLX_NEW(double, P);
+        double *y = PLX_NEW(double, d);
+        for (int k = 0; k < d; k++) y[k] = h < 2 ? m->kappa * num[h][k] / den[h] : m->kappa * m->yv[k];
+        plx_gspace_even_field(sp, y, NAN, z[h]);
+        free(y);
+    }
+    const char *nm[3] = {"low |s|", "high |s|", "all (fit)"};
+    for (int h = 0; h < 3; h++) say("  %-10s nose protrusion %.2f px\n", nm[h], protrusion(cx, sp, z[h]));
+    say("  midline profile (axis column), px:\n  %8s %9s %9s %9s\n", "Y0", nm[0], nm[1], nm[2]);
+    for (int row = 0; row < cx->L.rows; row++) {
+        int k = row * cx->L.cols + cx->L.cols / 2;
+        if (sp->omega[k] <= 0) continue;
+        say("  %8.1f %9.2f %9.2f %9.2f\n", plx_glat_Y0(&cx->L, k), z[0][k], z[1][k], z[2][k]);
+    }
+    for (int h = 0; h < 3; h++) free(z[h]);
+    for (int h = 0; h < 2; h++) free(num[h]);
+    free(as), free(yE), free(yV), free(yO), free(idx), free(ia), free(ib);
+}
+
 /* ---- real mode ------------------------------------------------------------------------------------------- */
 static int run_real_mode(const plx_args *a) {
     const char *flow = plx_arg_str(a, "flow", "runs/main/flow"), *pack = plx_arg_str(a, "pack", "runs/main/pack");
@@ -982,6 +1133,18 @@ static int run_real_mode(const plx_args *a) {
         cx.node_weight = nw.data;
     } else
         plx_log("no %s: unit node weights", path);
+    /* --nw raw | sqrt | floor | uniform: how the flow's node reliability enters ω. floor = max(w, 0.1).
+     * The choice is made by measurement (split-half agreement), see the report. */
+    const char *nwm = plx_arg_str(a, "nw", "raw");
+    if (cx.node_weight) {
+        float *w = cx.node_weight;
+        for (int k = 0; k < P; k++) {
+            if (!strcmp(nwm, "sqrt")) w[k] = sqrtf(fmaxf(w[k], 0));
+            else if (!strcmp(nwm, "floor")) w[k] = fmaxf(w[k], 0.1f);
+            else if (!strcmp(nwm, "uniform")) w[k] = 1;
+            else if (strcmp(nwm, "raw")) plx_die("--nw: raw, sqrt, floor or uniform");
+        }
+    }
     snprintf(path, sizeof path, "%s/sim.plxt", flow);
     if (plx_tensor_load(path, &sim) != PLX_OK || sim.dtype != PLX_F32 || sim.dim[0] != n) plx_die("cannot read %s", path);
     snprintf(path, sizeof path, "%s/mean_face.plxt", flow);
@@ -989,22 +1152,23 @@ static int run_real_mode(const plx_args *a) {
     snprintf(path, sizeof path, "%s/gray.plxt", pack);
     if (plx_tensor_map(path, &gray) != PLX_OK || gray.dim[0] != n) plx_die("cannot read %s (N = %d)", path, n);
 
-    /* flow quality -> prior weights: a non-converged fit (column --q-converged, default 6) or a
-     * folded field (min det(I + grad u) <= --q-jdet-min in column --q-jdet, default 4) is untrusted */
+    /* flow quality -> prior weights. quality.plxt columns (apps/plx_flow.c): cost, inlier, valid,
+     * min_jdet, max_u, step, flags; flags bit 0 untrusted by congealing, 1 fold, 2 not converged,
+     * 3 valid < 0.9, 4 step > 1 px. An image is untrusted when (flags & --q-mask) != 0; the default
+     * 27 = bits 0, 1, 3, 4 (non-convergence alone is not disqualifying). */
     float *prior = PLX_NEW(float, n);
     for (int i = 0; i < n; i++) prior[i] = 1;
     snprintf(path, sizeof path, "%s/quality.plxt", flow);
-    int qc = (int)plx_arg_int(a, "q-converged", 6), qj = (int)plx_arg_int(a, "q-jdet", 4), nbad = 0;
-    double jmin = plx_arg_num(a, "q-jdet-min", 0.2);
-    if (file_exists(path) && plx_tensor_load(path, &q) == PLX_OK && q.dtype == PLX_F32 && q.ndim == 2 && q.dim[0] == n) {
+    int qf = (int)plx_arg_int(a, "q-flags-col", 6), qmask = (int)plx_arg_int(a, "q-mask", 27), nbad = 0;
+    if (file_exists(path) && plx_tensor_load(path, &q) == PLX_OK && q.dtype == PLX_F32 && q.ndim == 2 &&
+        q.dim[0] == n && qf < q.dim[1]) {
         int Q = (int)q.dim[1];
         const float *qv = q.data;
         for (int i = 0; i < n; i++) {
-            if (qc >= 0 && qc < Q && qv[(size_t)i * Q + qc] < 0.5f) prior[i] = 0;
-            if (qj >= 0 && qj < Q && qv[(size_t)i * Q + qj] <= jmin) prior[i] = 0;
+            if (((int)qv[(size_t)i * Q + qf] & qmask) != 0) prior[i] = 0;
             nbad += prior[i] == 0;
         }
-        plx_log("quality: %d of %d images untrusted", nbad, n);
+        plx_log("quality: %d of %d images untrusted (flags & %d)", nbad, n, qmask);
     } else
         plx_log("no usable %s: every image trusted", path);
 
@@ -1016,25 +1180,26 @@ static int run_real_mode(const plx_args *a) {
     plx_geom_model m;
     double t0 = plx_now();
     if (plx_emerge(&cx.L, u.data, n, cx.node_weight, cx.core, cx.cs, &o, &m) != PLX_OK) plx_die("emerge failed");
-    say("plx_emerge --flow %s: %d images, %.1f s; %d untrusted by flow quality\n", flow, n, plx_now() - t0, nbad);
+    say("plx_emerge --flow %s: %d images, %.1f s; %d untrusted by flow quality (flags & %d); node weights: %s\n", flow,
+        n, plx_now() - t0, nbad, qmask, nwm);
     report(&cx, &m);
 
-    /* LFW View 1 verification by the depth codes (labels for evaluation only) */
+    /* LFW View 1 verification by the depth codes (labels for evaluation only; identities also
+     * define the by-identity split-half) */
     plx_lfw db;
     plx_pairs pl;
     const char *root = plx_arg_str(a, "lfw", "data/lfw"), *pairs = plx_arg_str(a, "pairs", "data/protocol/pairsDevTrain.txt");
-    if (plx_lfw_open(&db, root) == PLX_OK) {
-        if (db.n_images == n && plx_pairs_load(&pl, pairs, &db) == PLX_OK) {
-            verif_out v;
-            verify_pairs(&m, pl.p, pl.n, &v);
-            say("[6] depth-code verification, %s: AUC %.4f (%d pairs); both |yaw| > 10: %.4f (%d); > 20: %.4f (%d)\n",
-                pairs, v.auc[0], v.n[0], v.auc[1], v.n[1], v.auc[2], v.n[2]);
-            plx_pairs_free(&pl);
-        } else
-            plx_log("LFW index (%d images) does not match the flow (%d) or pairs unreadable: no verification",
-                    db.n_images, n);
-        plx_lfw_free(&db);
+    bool db_open = plx_lfw_open(&db, root) == PLX_OK, have_db = db_open && db.n_images == n;
+    if (db_open && !have_db) plx_log("LFW index (%d images) does not match the flow (%d): no identities", db.n_images, n);
+    if (have_db && plx_pairs_load(&pl, pairs, &db) == PLX_OK) {
+        verif_out v;
+        verify_pairs(&m, pl.p, pl.n, &v);
+        say("[6] depth-code verification, %s: AUC %.4f (%d pairs); both |yaw| > 10: %.4f (%d); > 20: %.4f (%d)\n", pairs,
+            v.auc[0], v.n[0], v.auc[1], v.n[1], v.auc[2], v.n[2]);
+        plx_pairs_free(&pl);
     }
+    if (!plx_arg_flag(a, "no-reliability")) reliability(&cx, u.data, prior, &o, &m, have_db ? &db : NULL, o.seed ^ 0x5911);
+    if (db_open) plx_lfw_free(&db);
     write_outputs(out, &cx, &m);
     diag_depth(diag, &cx, &m, NULL);
     diag_shape_modes(diag, &cx, &m);
