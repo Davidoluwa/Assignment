@@ -99,7 +99,11 @@ Requirements that the geometry depends on:
 - gauge: each `u_i` has its similarity component projected into `T_i`, and the population-mean
   of `u` (which by symmetry is x-odd / y-even) is folded back into the template each outer
   round, so the template stays the mean shape;
-- robustness: Huber-clipped residuals; images whose fit does not converge are flagged, not trusted.
+- robustness: Huber-clipped residuals; images whose fit does not converge are flagged, not trusted;
+- the 32 and 16 px rounds re-render through the field; the 8 px rounds keep the last render and
+  refine by sampling. At 8 px the orientation features respond to a sub-cell displacement too
+  differently from the displacement model for re-rendering to converge on real faces. Each
+  round's increment is damped (terms that vanish at convergence, so the affine part stays unbiased).
 
 Flow has no ground truth, so it is judged by self-consistency: (a) variance of warped features
 drops and the mean warped face sharpens; (b) **mirror consistency** — the flow of a mirrored
@@ -175,7 +179,25 @@ precision  Λ_i = I + s_i²·Bᵀ N_i⁻¹ B          ĉ_i = Λ_i⁻¹ · s_i ·
 A frontal photo (s ≈ 0) returns the prior with full uncertainty: no parallax, no depth claim.
 A 30° photo returns a confident personal depth. The representation knows what it does not know.
 
-### 5.6 Direct mirror stereo (single-image refinement)
+### 5.6 Relief: fine depth from the population, not from the photo
+What real data showed: a per-photo field has to be stiff (one photo is weak evidence, and a
+soft field chases beards and glasses), and that stiffness erases high-curvature parallax, so
+§5.3 recovers pose and a smooth convex dome but no nose. The depth pattern, however, is shared
+by everyone. Once each photo's yaw `s_i` is known, add one dense population-shared layer,
+`W_i(p) = T_i(p + u_i(p) + s_i·w(p)·x̂)`, and estimate `w` at pixel resolution as the regression
+coefficient of residual horizontal misalignment on yaw:
+
+```
+b_ik(p) = s_i·∂x F_ik(p)      Δw(p) = − G_σ*[Σ_i,k ω·b·ψ(r)] / (G_σ*[Σ_i,k ω·b²] + λ)
+```
+
+with each photo's own feature gradient, mirror twins folded in (`N(p) + N(σp)`), the plane
+gauge of §5.2, and the scale gauge `⟨v + w, v⟩ = ⟨v, v⟩` so κ and the yaw angles stay valid.
+13,233 photos per pixel replace the per-photo regulariser. Judged by split-half agreement of
+the high-pass part of `w`, a permutation control (shuffle `s_i`: the map must vanish), and
+recovery of a known synthetic relief.
+
+### 5.7 Direct mirror stereo (single-image refinement)
 The template flow gives E through cross-identity matching. The same quantity can be measured
 *within* the image: in the roll-aligned frame, mirror partners share a row, so for each row y
 and half-width w there is a midpoint `m(w, y)` with `F(m + w, y) ≈ flipperm F(m − w, y)`, and
