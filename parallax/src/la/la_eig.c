@@ -138,15 +138,25 @@ static void rot_push(rot_log *L, double c, double s, int i) {
 }
 
 /* Implicit QL with Wilkinson-style shift on the tridiagonal (d, e); e[i] couples d[i], d[i+1].
- * Each sweep chases the bulge from the bottom of the unreduced block [l, m] to its top. */
+ * Each sweep chases the bulge from the bottom of the unreduced block [l, m] to its top.
+ * Deflation: e[m] is dropped when it is negligible next to its neighbours (the classical local
+ * test, which keeps graded matrices accurate) OR next to ||T||. The second test matters for
+ * clusters of eigenvalues at rounding level (rank-deficient covariance matrices): the local test
+ * would ask for |e| ~ eps * 1e-13 there, below the noise the bulge chase itself injects, and QL
+ * would stall. Dropping |e| <= eps ||T|| is a perturbation no larger than the one the Householder
+ * reduction already made, so it costs no accuracy we claim. */
 static int tridiag_ql(double *d, double *e, int n, rot_log *log) {
+    double tnorm = 0;
+    for (int i = 0; i < n; i++) tnorm = PLX_MAX(tnorm, fabs(d[i]) + fabs(e[i]) + (i ? fabs(e[i - 1]) : 0.0));
+    const double small = DBL_EPSILON * tnorm;
+    int budget = 30 * n; /* total sweeps, as in LAPACK: ~2 per eigenvalue are typical */
     for (int l = 0; l < n; l++) {
-        for (int iter = 0;; iter++) {
+        for (;;) {
             int m = l;
             for (; m < n - 1; m++)
-                if (fabs(e[m]) <= DBL_EPSILON * (fabs(d[m]) + fabs(d[m + 1]))) break;
+                if (fabs(e[m]) <= DBL_EPSILON * (fabs(d[m]) + fabs(d[m + 1])) || fabs(e[m]) <= small) break;
             if (m == l) break;
-            if (iter == 60) return PLX_ENOCONV;
+            if (budget-- == 0) return PLX_ENOCONV;
             double g = (d[l + 1] - d[l]) / (2.0 * e[l]);
             double r = hypot(g, 1.0);
             g = d[m] - d[l] + e[l] / (g + copysign(r, g));
