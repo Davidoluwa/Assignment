@@ -17,7 +17,7 @@
 SHELL := /bin/bash
 CC    ?= cc
 BUILD ?= build
-OPT   ?= -O2 -march=native
+OPT   ?= -O3 -march=native
 
 CFLAGS := -std=c11 $(OPT) -g -Wall -Wextra -Wshadow -Wno-unused-parameter \
           -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -Isrc -pthread $(EXTRA_CFLAGS)

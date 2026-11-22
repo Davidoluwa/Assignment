@@ -767,8 +767,8 @@ int plx_jpeg_decode_u8(const uint8_t *data, size_t len, int *w, int *h, int *c, 
 }
 
 int plx_jpeg_decode(const uint8_t *data, size_t len, plx_img *out) {
-    int w, h, c;
-    uint8_t *px;
+    int w = 0, h = 0, c = 0;
+    uint8_t *px = NULL;
     int st = plx_jpeg_decode_u8(data, len, &w, &h, &c, &px);
     if (st < 0) return st;
     *out = plx_img_from_u8(px, w, h, c, 1.0f / 255.0f);
