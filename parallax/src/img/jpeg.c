@@ -554,7 +554,9 @@ static int jpeg_run(jdec *d, bool header_only) {
 /* ---- inverse DCT -----------------------------------------------------------------------
  * libjpeg's jpeg_idct_islow: the Loeffler-Ligtenberg-Moschytz 1-D factorisation applied to
  * columns then rows, constants scaled by 2^13, pass-1 outputs kept with 2 extra fraction bits.
- * 64-bit intermediates (libjpeg's JLONG on LP64) so corrupt coefficients cannot overflow. */
+ * 64-bit intermediates (libjpeg's JLONG on LP64) so corrupt coefficients cannot overflow.
+ * DESCALE relies on >> of a negative value being an arithmetic (flooring) shift: implementation-
+ * defined in C, true of every compiler we target, and the same assumption libjpeg makes. */
 #define CONST_BITS 13
 #define PASS1_BITS 2
 #define FIX(x) ((int64_t)((x) * (1 << CONST_BITS) + 0.5))

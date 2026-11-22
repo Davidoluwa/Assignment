@@ -11,6 +11,9 @@ Test-only tooling: Python never runs inside Parallax. Run from the project root 
          4:4:4 / 4:2:2 / 4:4:0 / 4:1:1 / 3x1, restart intervals, odd sizes, Adobe RGB, 16-bit DQT,
          SOF1, fill bytes, split/duplicated tables, missing DHT, non-interleaved scans) and
          compares each one. Exit status is non-zero if any image differs.
+--png    also has plx_decode_dump write every synthetic image (and the first --png-lfw LFW
+         images) as PNG: native channels, +alpha and 16-bit gray. PIL must read each back
+         exactly; the LFW subset also reports the compression ratio.
 """
 import argparse
 import io
@@ -42,12 +45,13 @@ def pil_rgb(path):
         return np.asarray(im.convert("RGB"))
 
 
-def run_dump(dump, paths, work, tag, env=None):
+def run_dump(dump, paths, work, tag, png_dir=None):
     lst = os.path.join(work, tag + ".txt")
     out = os.path.join(work, tag + ".plxt")
     with open(lst, "w") as f:
         f.write("\n".join(paths) + "\n")
-    r = subprocess.run([dump, "--list", lst, "--out", out], capture_output=True, text=True, env=env)
+    cmd = [dump, "--list", lst, "--out", out] + (["--png", png_dir] if png_dir else [])
+    r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         return None, r.stderr.strip()
     return read_plxt(out), r.stderr.strip()
@@ -67,6 +71,33 @@ def compare(mine, paths):
         total += float(d.sum())
         count += d.size
     return ndiff, maxd, total / max(count, 1), worst
+
+
+def check_pngs(png_dir, mine, paths):
+    """mine: [N, H, W, 3] from the dump; returns (bad files, png bytes, raw bytes)."""
+    bad, png_bytes, raw_bytes = 0, 0, 0
+    for i, p in enumerate(paths):
+        with Image.open(p) as im:
+            gray = im.mode == "L"
+        rgb = mine[i].astype(np.int32)
+        native = rgb[..., :1] if gray else rgb
+        want = {
+            f"{i:06d}.png": native,
+            f"{i:06d}_a.png": np.concatenate([native, native[..., :1] ^ 0x5A], axis=2),
+            f"{i:06d}_16.png": (native[..., :1] << 8) | native[..., -1:],
+        }
+        for name, ref in want.items():
+            path = os.path.join(png_dir, name)
+            png_bytes += os.path.getsize(path)
+            raw_bytes += ref.size * (2 if name.endswith("_16.png") else 1)
+            with Image.open(path) as im:
+                im.load()
+                got = np.asarray(im).astype(np.int32)
+            got = got.reshape(ref.shape) if got.size == ref.size else None
+            if got is None or not np.array_equal(got, ref):
+                print(f"  PNG mismatch: {path}")
+                bad += 1
+    return bad, png_bytes, raw_bytes
 
 
 # ---------------------------------------------------------------------------------------------
@@ -372,6 +403,8 @@ def build_synth(src, work):
     cases["fill_bytes_prog"] = add_fill_bytes(pil_jpeg(im, quality=88, progressive=True))
     cases["no_dht_mjpeg"] = strip_dht(plain)
     cases["sof1"] = to_sof1(plain)
+    cases["wide_30000x3"] = pil_jpeg(base.resize((30000, 3), Image.BICUBIC), quality=90)
+    cases["tall_2x3000_gray"] = pil_jpeg(base.resize((2, 3000), Image.BICUBIC).convert("L"))
 
     png = os.path.join(work, "src.png")
     base.resize((131, 77), Image.BICUBIC).save(png)
@@ -409,6 +442,8 @@ def main():
     ap.add_argument("--lfw")
     ap.add_argument("--synth")
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--png", action="store_true")
+    ap.add_argument("--png-lfw", type=int, default=300)
     args = ap.parse_args()
     os.makedirs(args.work, exist_ok=True)
     failed = False
@@ -427,18 +462,27 @@ def main():
         print(f"LFW: {len(paths)} images, {ndiff} differ, max abs diff {maxd}, mean abs diff {mean:.3g}"
               + (f" (worst {worst})" if worst else ""))
         failed |= ndiff > 0
+        if args.png:
+            sub = paths[:args.png_lfw]
+            png_dir = os.path.join(args.work, "png_lfw")
+            mine, _ = run_dump(args.dump, sub, args.work, "lfw_png", png_dir)
+            bad, pb, rb = check_pngs(png_dir, mine, sub)
+            print(f"PNG on {len(sub)} LFW images x 3 variants: {bad} mismatches; {pb} bytes for {rb} raw bytes"
+                  f" (ratio {rb / pb:.2f}:1)")
+            failed |= bad > 0
 
     if args.synth:
         paths = build_synth(args.synth, os.path.join(args.work, "synth"))
-        bad = 0
+        bad = png_bad = 0
         for p in paths:
             try:
                 ref = pil_rgb(p)
             except Exception as e:  # PIL refusing a file means the case itself is invalid
                 print(f"  skip {os.path.basename(p)}: PIL cannot decode ({e})")
                 continue
-            mine, log = run_dump(args.dump, [p], args.work, "one")
             name = os.path.basename(p)
+            png_dir = os.path.join(args.work, "png_synth", name[:-4]) if args.png else None
+            mine, log = run_dump(args.dump, [p], args.work, "one", png_dir)
             if mine is None:
                 print(f"  FAIL {name}: {log}")
                 bad += 1
@@ -446,10 +490,14 @@ def main():
             d = np.abs(mine[0].astype(np.int16) - ref.astype(np.int16))
             status = "ok  " if d.max() == 0 else "DIFF"
             bad += d.max() != 0
+            if png_dir:
+                png_bad += check_pngs(png_dir, mine, [p])[0]
             print(f"  {status} {name:32s} {ref.shape[1]}x{ref.shape[0]}  differing px {int((d.max(axis=2) > 0).sum())}"
                   f"  max {int(d.max())}  mean {d.mean():.3g}")
         print(f"synthetic: {len(paths)} files, {bad} differ or fail")
-        failed |= bad > 0
+        if args.png:
+            print(f"PNG on synthetic set x 3 variants: {png_bad} mismatches")
+        failed |= bad > 0 or png_bad > 0
     return 1 if failed else 0
 
 

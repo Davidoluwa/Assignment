@@ -184,8 +184,13 @@ static const uint8_t k_cl_order[19] = {16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 
 
 #define WSIZE 32768
 #define HASH_BITS 15
-#define MAX_CHAIN 128   /* candidates examined per position: zlib level ~6-7 effort */
-#define NICE_LEN 192    /* a match this long is good enough to stop searching */
+/* Search effort, roughly zlib level 5: chain candidates per position, a quarter of that once
+ * the pending match is already GOOD_LEN long, no lazy look-ahead past MAX_LAZY, and stop at
+ * NICE_LEN. */
+#define MAX_CHAIN 32
+#define GOOD_LEN 8
+#define MAX_LAZY 32
+#define NICE_LEN 160
 #define BLOCK_TOKENS 65536
 
 typedef struct {
@@ -364,16 +369,29 @@ static void insert(deflater *z, size_t i) {
     z->head[h] = (int64_t)i;
 }
 
+/* Length of the common prefix of a and b, up to limit; 8 bytes per step while it can. */
+static int common_prefix(const uint8_t *a, const uint8_t *b, int limit) {
+    int l = 0;
+    while (l + 8 <= limit) {
+        uint64_t x, y;
+        memcpy(&x, a + l, 8);
+        memcpy(&y, b + l, 8);
+        if (x != y) break;
+        l += 8;
+    }
+    while (l < limit && a[l] == b[l]) l++;
+    return l;
+}
+
 /* Longest match for position i among the chain of earlier positions with the same hash. */
-static int longest(const deflater *z, size_t i, int *dist) {
+static int longest(const deflater *z, size_t i, int chain, int *dist) {
     const uint8_t *s = z->src;
     int limit = (int)PLX_MIN(z->n - i, (size_t)258), best = 0;
     int64_t cand = z->head[hash3(s + i)];
-    for (int chain = MAX_CHAIN; cand >= 0 && (int64_t)i - cand <= WSIZE && chain > 0; chain--) {
+    for (; cand >= 0 && (int64_t)i - cand <= WSIZE && chain > 0; chain--) {
         const uint8_t *a = s + cand, *b = s + i;
-        if (a[best] == b[best]) {
-            int l = 0;
-            while (l < limit && a[l] == b[l]) l++;
+        if (a[best] == b[best] && a[0] == b[0]) {
+            int l = common_prefix(a, b, limit);
             if (l > best) {
                 best = l;
                 *dist = (int)((int64_t)i - cand);
@@ -407,12 +425,13 @@ size_t plx_zlib_compress(const uint8_t *src, size_t n, uint8_t **out) {
     int prev_len = 0, prev_dist = 0;
     for (size_t i = 0; i < n;) {
         int cur_len = 0, cur_dist = 0;
+        bool lazy = !have_prev || prev_len < MAX_LAZY;
         if (n - i >= 3) {
-            cur_len = longest(z, i, &cur_dist);
+            if (lazy) cur_len = longest(z, i, have_prev && prev_len >= GOOD_LEN ? MAX_CHAIN / 4 : MAX_CHAIN, &cur_dist);
             insert(z, i);
         }
         if (have_prev) {
-            if (prev_len && cur_len <= prev_len) {
+            if (prev_len && (!lazy || cur_len <= prev_len)) {
                 emit(z, prev_len, prev_dist);
                 size_t end = i - 1 + (size_t)prev_len;
                 for (size_t p = i + 1; p < end; p++)
