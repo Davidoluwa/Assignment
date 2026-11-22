@@ -59,6 +59,51 @@ plx_img plx_fl_warp_crop(const plx_img *gray, plx_sim T, const plx_lattice *L, c
     return out;
 }
 
+/* map with the relief layer: the x displacement gains s · w at the canonical pixel. */
+static void warp_map_relief(plx_sim T, const plx_lattice *L, const float *u, double s, const plx_img *w, int margin,
+                            plx_img *map) {
+    PLX_ASSERT(w->w == PLX_CANON_W && w->h == PLX_CANON_H && w->c == 1);
+    for (int qy = 0; qy < map->h; qy++)
+        for (int qx = 0; qx < map->w; qx++) {
+            int x = qx - margin, y = qy - margin;
+            double v[2], ix, iy;
+            plx_lat_eval(L, u, x, y, v);
+            v[0] += s * PLX_PX(w, PLX_CLAMP(x, 0, PLX_CANON_W - 1), PLX_CLAMP(y, 0, PLX_CANON_H - 1), 0);
+            plx_sim_apply(T, x + v[0], y + v[1], &ix, &iy);
+            PLX_PX(map, qx, qy, 0) = (float)ix;
+            PLX_PX(map, qx, qy, 1) = (float)iy;
+        }
+}
+
+void plx_fl_render_gray_relief(const plx_img *gray, plx_sim T, const plx_lattice *L, const float *u, double s,
+                               const plx_img *w, int margin, plx_interp interp, plx_img *out, plx_img *valid) {
+    if (!w || s == 0) {
+        plx_fl_render_gray(gray, T, L, u, margin, interp, out, valid);
+        return;
+    }
+    PLX_ASSERT(out->w == PLX_CANON_W + 2 * margin && out->h == PLX_CANON_H + 2 * margin && out->c == gray->c);
+    plx_img map = plx_canon_new(2, margin);
+    warp_map_relief(T, L, u, s, w, margin, &map);
+    plx_warp_map(gray, &map, interp, out, valid);
+    plx_img_free(&map);
+}
+
+void plx_fl_render_relief(const plx_img *gray, plx_sim T, const plx_lattice *L, const float *u, double s,
+                          const plx_img *w, const plx_cg_params *p, plx_cg_view *v) {
+    PLX_ASSERT(gray->c == 1);
+    v->gray = plx_canon_new(1, p->margin);
+    v->valid = plx_canon_new(1, p->margin);
+    plx_fl_render_gray_relief(gray, T, L, u, s, w, p->margin, p->interp, &v->gray, &v->valid);
+    plx_cg_view_finish(p, v);
+}
+
+plx_img plx_fl_warp_crop_relief(const plx_img *gray, plx_sim T, const plx_lattice *L, const float *u, double s,
+                                const plx_img *w) {
+    plx_img out = plx_canon_new(gray->c, 0);
+    plx_fl_render_gray_relief(gray, T, L, u, s, w, 0, PLX_INTERP_BILINEAR, &out, NULL);
+    return out;
+}
+
 /* ---- reference -------------------------------------------------------------------------- */
 plx_fl_ref plx_fl_ref_build(const plx_cg_template *t, const plx_fl_params *p, const plx_fl_stage *st) {
     const plx_cg_params *cp = &p->cg;

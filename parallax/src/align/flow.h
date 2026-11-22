@@ -108,6 +108,19 @@ void plx_fl_render_gray(const plx_img *gray, plx_sim T, const plx_lattice *L, co
 /* The Ω (128 x 160) gray image through W, bilinear: the "frontalised" crop. */
 plx_img plx_fl_warp_crop(const plx_img *gray, plx_sim T, const plx_lattice *L, const float *u);
 
+/* The same three with the population depth-relief layer of geom/relief.h added to the warp:
+ *     W(p) = T(p + u(p) + s · w(p) · x̂),
+ * s the photo's yaw parallax (px per unit depth pattern), w a dense 1-channel map on Ω
+ * (128 x 160) read at the canonical pixel itself (Ω+ pixels sample at integer canonical points;
+ * outside Ω the map is replicate-extended, as everywhere in ops.h). w = NULL or s = 0 is exactly
+ * the plain render. */
+void plx_fl_render_gray_relief(const plx_img *gray, plx_sim T, const plx_lattice *L, const float *u, double s,
+                               const plx_img *w, int margin, plx_interp interp, plx_img *out, plx_img *valid);
+void plx_fl_render_relief(const plx_img *gray, plx_sim T, const plx_lattice *L, const float *u, double s,
+                          const plx_img *w, const plx_cg_params *p, plx_cg_view *v);
+plx_img plx_fl_warp_crop_relief(const plx_img *gray, plx_sim T, const plx_lattice *L, const float *u, double s,
+                                const plx_img *w);
+
 /* ---- reference: the template prepared for one stage (shared by all images, read-only) ---- */
 typedef struct {
     plx_fl_stage st;
