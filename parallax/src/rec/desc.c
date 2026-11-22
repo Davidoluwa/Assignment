@@ -55,7 +55,8 @@ void plx_desc_describe(const plx_desc_params *p, char *buf, size_t cap) {
     DESC_PUT("blocks=");
     for (int i = 0; i < p->n_blocks; i++)
         DESC_PUT("%s%s@%d:%d", i ? "," : "", block_names[p->block[i].kind], p->block[i].level, p->block[i].cell);
-    DESC_PUT(" region=%d,%d,%d,%d sqrt=%d mirror=%d", p->x0, p->y0, p->w, p->h, (int)p->sqrt_hist, (int)p->mirror);
+    DESC_PUT(" region=%d,%d,%d,%d sqrt=%d mirror=%d", p->x0, p->y0, p->w, p->h, (int)p->sqrt_hist,
+             p->mirror ? 1 + (int)p->mirror_weighted : 0);
     const plx_photo_params *ph = &p->photo;
     DESC_PUT(" photo=%g,%g,%g,%g,%g", ph->gamma, ph->dog_s0, ph->dog_s1, ph->ce_alpha, ph->ce_tau);
     const plx_orient_params *o = &p->orient;
@@ -89,6 +90,18 @@ plx_desc_layout plx_desc_layout_of(const plx_desc_params *p) {
         L.n_cells += L.cells_x[i] * L.cells_y[i];
     }
     return L;
+}
+
+void plx_desc_layout_append_code(plx_desc_layout *L, int dim) {
+    PLX_ASSERT(L->n_blocks < PLX_DESC_MAX_BLOCKS && dim >= 1);
+    int i = L->n_blocks++;
+    L->cells_x[i] = L->cells_y[i] = 1;
+    L->bins[i] = dim;
+    L->off[i] = L->d;
+    L->dim[i] = dim;
+    L->cell_off[i] = L->n_cells;
+    L->d += dim;
+    L->n_cells += 1;
 }
 
 /* Per-level working images, made on first use. */
@@ -190,12 +203,25 @@ void plx_desc_compute(const plx_desc_params *p, const plx_img *tex, const plx_im
     float *d2 = PLX_NEW(float, L.d), *w1 = PLX_NEW(float, L.n_cells), *w2 = PLX_NEW(float, L.n_cells);
     desc_pass(p, tex, conf, PLX_HNORM_L1, desc, w1);
     desc_pass(p, &ft, conf ? &fc : NULL, PLX_HNORM_L1, d2, w2);
-    for (int j = 0; j < L.d; j++) {
-        float v = 0.5f * (desc[j] + d2[j]);
-        desc[j] = p->sqrt_hist ? sqrtf(v) : v;
-    }
-    if (cell_w)
-        for (int c = 0; c < L.n_cells; c++) cell_w[c] = 0.5f * (w1[c] + w2[c]);
+    /* Weighted pooling lets the better-seen twin speak for both: where one side of a turned face
+     * is stretched (low confidence), its cell comes mostly from the mirror partner, and the
+     * pooled cell is then as trustworthy as that partner. Under uniform confidence both rules
+     * are the plain average. */
+    for (int i = 0; i < L.n_blocks; i++)
+        for (int c = 0; c < L.cells_x[i] * L.cells_y[i]; c++) {
+            int cell = L.cell_off[i] + c;
+            float a = 0.5f, wc = 0.5f * (w1[cell] + w2[cell]);
+            if (p->mirror_weighted) {
+                float sw = w1[cell] + w2[cell];
+                a = sw > 0.0f ? w1[cell] / sw : 0.5f;
+                wc = fmaxf(w1[cell], w2[cell]);
+            }
+            for (int j = L.off[i] + c * L.bins[i]; j < L.off[i] + (c + 1) * L.bins[i]; j++) {
+                float v = a * desc[j] + (1.0f - a) * d2[j];
+                desc[j] = p->sqrt_hist ? sqrtf(v) : v;
+            }
+            if (cell_w) cell_w[cell] = wc;
+        }
     free(d2);
     free(w1);
     free(w2);

@@ -23,6 +23,7 @@
 #define PLX_REC_C0Y 79.5f
 
 /* ---- texture ------------------------------------------------------------------------- */
+#define PLX_REC_FLOW_DOF (2 * 21 * 17) /* one field of flow/u.plxt */
 /* 2x3 affine (plx_warp_affine form) of the similarity sim = (a, b, tx, ty):
  * T(p) = [a -b; b a](p - c0) + (124.5 + tx, 128.5 + ty), canonical -> image pixels. */
 void plx_rec_sim_affine(const float sim[4], float A[6]);
@@ -32,6 +33,21 @@ void plx_rec_sim_affine(const float sim[4], float A[6]);
  * (scale |(a, b)| > 1) the source is pre-blurred so the texture is not aliased. conf gets the
  * in-image mask (1 where the source point lies inside the photo, else 0). */
 void plx_rec_texture_sim(const plx_img *gray, const float sim[4], plx_img *tex, plx_img *conf);
+
+/* Canonical texture through the dense flow, W(p) = T(p + alpha u(p)) (align/flow.h's rendering
+ * path, bicubic). u: one field of flow/u.plxt, 2 x 21 x 17 floats on the 8-px lattice
+ * (component, row, column). alpha = 1 is the full frontalising warp, alpha = 0 the similarity
+ * alone; in between keeps part of the person's own in-plane shape. conf as above. */
+void plx_rec_texture_flow(const plx_img *gray, const float sim[4], const float *u, float alpha, plx_img *tex,
+                          plx_img *conf);
+
+/* Flow-only confidence. jdet (PLX_REC_TEX_W x PLX_REC_TEX_H) gets det(I + alpha grad u) at every
+ * canonical pixel: the photo area behind one canonical pixel relative to the similarity's. Below
+ * 1 the warp is stretching few photo pixels over many canonical ones (the far side of a turned
+ * face), so the texture there is interpolated rather than observed.
+ * plx_rec_conf_from_jdet multiplies conf in place by clamp(jdet, 0, 1)^power. */
+void plx_rec_flow_jdet(const float *u, float alpha, plx_img *jdet);
+void plx_rec_conf_from_jdet(const plx_img *jdet, float power, plx_img *conf);
 
 /* ---- photometric normalisation (Tan & Triggs chain) -----------------------------------
  *   1. gamma:  v <- max(v, 0)^gamma              (gamma <= 0 or == 1: skipped)
@@ -64,7 +80,9 @@ void plx_photo_normalize(plx_img *tex, const plx_img *conf, const plx_photo_para
  * Bhattacharyya coefficient). Per-cell weights are the cell's mean confidence in [0, 1].
  * With `mirror`, each cell's L1 histogram is averaged with that of the mirrored texture (same
  * cell index = mirror-image location) before the sqrt: the descriptor of a face and its mirror
- * twin are then identical.
+ * twin are then identical. With `mirror_weighted` the two are mixed in proportion to their cell
+ * confidences (and the pooled cell weight is the larger of the two), so a stretched or hidden
+ * half-face is filled from its visible mirror partner.
  * Descriptor layout: blocks in order, within a block plx_cell_grid's (cell, bin) order. */
 typedef enum { PLX_BLOCK_LBP1 = 0, PLX_BLOCK_LBP2, PLX_BLOCK_ORI } plx_block_kind;
 
@@ -81,6 +99,7 @@ typedef struct {
     plx_block_spec block[PLX_DESC_MAX_BLOCKS];
     bool sqrt_hist;             /* Hellinger mapping of each L1-normalised cell */
     bool mirror;                /* pool each cell with its mirror-twin cell (needs 2 x0 + w = 128) */
+    bool mirror_weighted;       /* pool by the two cells' confidences instead of averaging */
     plx_photo_params photo;     /* applied to the texture the LBP blocks see */
     plx_orient_params orient;   /* ORI blocks */
 } plx_desc_params;
@@ -103,6 +122,12 @@ typedef struct {
     int bins[PLX_DESC_MAX_BLOCKS];        /* dims per cell */
 } plx_desc_layout;
 plx_desc_layout plx_desc_layout_of(const plx_desc_params *p);
+/* Seam for non-texture codes (shape / depth coefficients from the geometry stage): appends a
+ * pseudo-block of `dim` dimensions with one cell, so the caller can append those columns to each
+ * descriptor row (and one weight to its cell weights: the code's confidence) and every matcher
+ * treats the code as one more block (its own PCA-whitening group and vote, the supervised stage
+ * sees it alongside the texture). plx_desc_compute never touches it. */
+void plx_desc_layout_append_code(plx_desc_layout *L, int dim);
 
 /* Descriptor of one canonical texture. tex: PLX_REC_TEX_W x PLX_REC_TEX_H x 1 (not modified).
  * conf: same shape, values in [0, 1], or NULL for uniform confidence. desc gets layout.d floats,
