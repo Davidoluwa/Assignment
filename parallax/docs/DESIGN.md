@@ -138,11 +138,21 @@ Y-slope over the face support.
 Stack E⊥ over the population: `E⊥_i(p) = s_i · v(p) + noise`, rank 1. `v` (unit weighted RMS)
 is the top right singular vector, sign fixed by convexity (centre of the face positive).
 `s_i = ⟨E⊥_i, v⟩ / ⟨v, v⟩` is yaw in units of depth-RMS·sin θ. Pitch from the same pattern:
-`t_i = −⟨V⊥_i, v⟩ / ⟨v, v⟩`. That the *one* pattern v explains both the horizontal channel
-(yaw) and the vertical channel (pitch) is the rigid-body check, and it is reported.
+`t_i = −⟨V⊥_i, q⟩` with `q ∝ (C + μI)⁻¹ v`, `qᵀv = 1`, where C is the scatter of V⊥ and μ its
+mean eigenvalue. (The plain projection onto v is dominated by identity heights `b` that happen
+to resemble v; the shrunk generalised-least-squares direction suppresses them without knowing
+the pitch variance.) That the *one* pattern v explains both the horizontal channel (yaw) and
+the vertical channel (pitch) is the rigid-body check, and it is reported. Pitch, like the
+Y-tilt of z̄, is defined relative to the population-mean viewpoint: the two are the same gauge.
+
+The robust weights of the rank-1 fit are judged against photos of similar s²; a global
+residual threshold would discard exactly the turned faces that carry the signal.
 
 ### 5.4 Metric scale without a ruler
-`z̄ = κ·v` and `sinθ_i = s_i / κ` for one unknown κ. A turned face is also *narrower*:
+`z̄ = κ·v` for one unknown κ. The similarity gauge divides every field by that photo's own
+foreshortened scale `ρ_i = f_x·cosθ_i + (1 − f_x)·cosφ_i` (`f_x = Σg·X0² / Σg·(X0² + Y0²)` over
+the gauge nodes), so the pose relations are `sinθ_i = ρ_i·s_i/κ` and
+`sinφ_i·cosθ_i = ρ_i·t_i/κ`, solved by fixed point. A turned face is also *narrower*:
 the anisotropy `A_i = (1 + slope of O on X0) / (1 + slope of V on Y0) = (cosθ_i / cosφ_i)·ar_i`
 where `ar_i` is the person's own aspect ratio (independent of pose). κ is the value that makes
 `log A_i ≈ c + ½·log(1 − s_i²/κ²) − ½·log(1 − t_i²/κ²)` hold across the population (robust 1-D
@@ -150,12 +160,16 @@ fit). This is Tomasi-Kanade's orthonormality constraint, applied statistically a
 people instead of across frames.
 
 ### 5.5 Personal depth, with honest uncertainty
-`E⊥_i = s_i·(v + B·c_i) + ε`, `ε ~ N(0, σ²)`, `c_i ~ N(0, I)`, `B ⟂ v` (the bas-relief gauge:
-depth scale along v is not observable in one view, so it is defined away). Fitted by EM
-(weighted probabilistic PCA with known per-sample gain s_i). For one image:
+`R_i = E⊥_i − s_i·v = s_i·B·c_i + n_i`, `c_i ~ N(0, I)`, `B ⟂ v` (the bas-relief gauge: depth
+scale along v is not observable in one view, so it is defined away), and `n_i` is
+pose-independent nuisance (flow error, asymmetry, lighting bias) with covariance Σ0. Then
+`Cov(R | s) = s²·BBᵀ + Σ0`: **personal depth variation is exactly the part of the residual
+covariance that grows with sin²(yaw)**. Regressing `R_i R_iᵀ` on `s_i²` gives the slope matrix
+Σ_B (its leading eigenvectors are B) and the intercept Σ0. For one image, with
+`N_i = Σ0 + s_i²·Σ_rest` (Σ_rest = the part of Σ_B beyond the kept modes):
 
 ```
-precision  Λ_i = I + (s_i²/σ²)·BᵀB          ĉ_i = Λ_i⁻¹ · (s_i/σ²) · Bᵀ(E⊥_i − s_i·v)
+precision  Λ_i = I + s_i²·Bᵀ N_i⁻¹ B          ĉ_i = Λ_i⁻¹ · s_i · Bᵀ N_i⁻¹ R_i
 ```
 
 A frontal photo (s ≈ 0) returns the prior with full uncertainty: no parallax, no depth claim.
