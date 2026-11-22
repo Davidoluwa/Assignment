@@ -20,6 +20,8 @@ double la_dot(const double *x, const double *y, size_t n);
 double la_dot_strided(const double *x, int64_t incx, const double *y, int64_t incy, int n);
 double la_norm_strided(const double *x, int64_t inc, int n); /* overflow/underflow safe */
 void   la_axpy(double *restrict y, double alpha, const double *restrict x, size_t n);
+/* Plane rotation of two distinct rows: x <- c x - s y, y <- s x + c y. */
+void   la_rot(double *restrict x, double *restrict y, size_t n, double c, double s);
 
 /* ---- gemm core -------------------------------------------------------------------------
  * An operand is a logical matrix op(X) whose element (i, j) lives at base[i * rs + j * cs], with
@@ -84,6 +86,9 @@ void la_qr_free(la_qr *q);
 /* Thin SVD of the m x n row-major array a (destroyed), k = min(m, n); U (m x k) and V (n x k)
  * nullable, contiguous. Used by plx_svd and the PCA routes. */
 int la_svd_raw(double *a, int m, int n, double *U, double *s, double *V);
+
+/* idx[0..n) = indices of keys in descending order (ties by index: deterministic). */
+void la_argsort_desc(const double *keys, int n, int *idx);
 
 /* Makes the largest-magnitude entry of each column of the r x c array X positive; when Y is
  * non-NULL (ry x c) its columns are flipped along (paired singular vectors). */

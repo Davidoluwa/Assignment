@@ -44,8 +44,28 @@ double la_dot_strided(const double *x, int64_t incx, const double *y, int64_t in
     return s0 + s1;
 }
 
+/* The fixed-length inner loops are deliberate: at -O2 GCC's "very cheap" vectoriser only
+ * vectorises loops whose trip count is a known multiple of the vector length. */
 void la_axpy(double *restrict y, double alpha, const double *restrict x, size_t n) {
-    for (size_t i = 0; i < n; i++) y[i] = fma(alpha, x[i], y[i]);
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8)
+        for (int j = 0; j < 8; j++) y[i + j] = fma(alpha, x[i + j], y[i + j]);
+    for (; i < n; i++) y[i] = fma(alpha, x[i], y[i]);
+}
+
+void la_rot(double *restrict x, double *restrict y, size_t n, double c, double s) {
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8)
+        for (int j = 0; j < 8; j++) {
+            double xj = x[i + j], yj = y[i + j];
+            x[i + j] = c * xj - s * yj;
+            y[i + j] = s * xj + c * yj;
+        }
+    for (; i < n; i++) {
+        double xi = x[i], yi = y[i];
+        x[i] = c * xi - s * yi;
+        y[i] = s * xi + c * yi;
+    }
 }
 
 /* Sum of squares is fast but over/underflows outside ~[1e-150, 1e150]; only then do the scaled
@@ -152,4 +172,23 @@ void la_fix_signs(double *X, int r, int c, double *Y, int ry) {
         if (Y)
             for (int i = 0; i < ry; i++) Y[(size_t)i * c + j] = -Y[(size_t)i * c + j];
     }
+}
+
+typedef struct {
+    double key;
+    int idx;
+} keyed;
+
+static int keyed_desc(const void *pa, const void *pb) {
+    const keyed *a = pa, *b = pb;
+    if (a->key != b->key) return a->key > b->key ? -1 : 1;
+    return a->idx - b->idx;
+}
+
+void la_argsort_desc(const double *keys, int n, int *idx) {
+    keyed *k = plx_malloc(sizeof(keyed) * (size_t)PLX_MAX(n, 1));
+    for (int i = 0; i < n; i++) k[i] = (keyed){keys[i], i};
+    qsort(k, (size_t)n, sizeof(keyed), keyed_desc);
+    for (int i = 0; i < n; i++) idx[i] = k[i].idx;
+    free(k);
 }

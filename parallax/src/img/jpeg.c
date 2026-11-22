@@ -73,6 +73,7 @@ static int huff_build(huff *t, const uint8_t counts[16], const uint8_t *vals) {
         int cnt = counts[l - 1];
         t->delta[l] = k - code;
         for (int i = 0; i < cnt; i++, k++, code++) {
+            if (code >= (1 << l)) return PLX_EFORMAT; /* over-subscribed: not a prefix code */
             if (l <= FAST_BITS) {
                 int shift = FAST_BITS - l;
                 for (int f = 0; f < (1 << shift); f++) {
@@ -81,7 +82,6 @@ static int huff_build(huff *t, const uint8_t counts[16], const uint8_t *vals) {
                 }
             }
         }
-        if (code > (1 << l)) return PLX_EFORMAT; /* over-subscribed: not a prefix code */
         t->maxcode[l] = code - 1;
         code <<= 1;
     }

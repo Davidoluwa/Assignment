@@ -121,13 +121,8 @@ static void rot_apply_slice(int64_t b, int tid, void *ctx) {
     const rot_log *L = ctx;
     const int c0 = (int)b * L->slice, w = PLX_MIN(L->slice, L->dim - c0);
     for (size_t q = 0; q < L->n; q++) {
-        const double c = L->r[q].c, s = L->r[q].s;
-        double *x = L->Zt + (size_t)L->r[q].i * L->dim + c0, *y = x + L->dim;
-        for (int j = 0; j < w; j++) {
-            double xj = x[j], yj = y[j];
-            y[j] = s * xj + c * yj;
-            x[j] = c * xj - s * yj;
-        }
+        double *x = L->Zt + (size_t)L->r[q].i * L->dim + c0;
+        la_rot(x, x + L->dim, (size_t)w, L->r[q].c, L->r[q].s);
     }
 }
 
@@ -186,22 +181,6 @@ static int tridiag_ql(double *d, double *e, int n, rot_log *log) {
 
 /* ---- public ------------------------------------------------------------------------------- */
 
-static const double *g_sort_keys;
-static int cmp_desc(const void *a, const void *b) {
-    double x = g_sort_keys[*(const int *)a], y = g_sort_keys[*(const int *)b];
-    return x > y ? -1 : x < y ? 1 : (*(const int *)a - *(const int *)b);
-}
-
-/* Index order of keys[0..n) by descending value (ties by index, so the result is deterministic). */
-static void sort_desc(const double *keys, int n, int *idx) {
-    for (int i = 0; i < n; i++) idx[i] = i;
-    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER; /* qsort has no context argument */
-    pthread_mutex_lock(&mu);
-    g_sort_keys = keys;
-    qsort(idx, (size_t)n, sizeof(int), cmp_desc);
-    pthread_mutex_unlock(&mu);
-}
-
 int plx_eigh(const plx_mat *A, double *w, plx_mat *V) {
     const int n = A->rows;
     PLX_ASSERT(A->cols == n && n >= 1);
@@ -227,7 +206,7 @@ int plx_eigh(const plx_mat *A, double *w, plx_mat *V) {
     int rc = tridiag_ql(d, e, n, V ? &log : NULL);
     int *idx = plx_malloc(sizeof(int) * n);
     if (rc == PLX_OK) {
-        sort_desc(d, n, idx);
+        la_argsort_desc(d, n, idx);
         for (int j = 0; j < n; j++) w[j] = d[idx[j]];
     }
     if (V && rc == PLX_OK) {

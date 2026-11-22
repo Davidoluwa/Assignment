@@ -201,9 +201,10 @@ plx_mat plx_matmul(const plx_mat *A, const plx_mat *B) {
 }
 
 void plx_syrk(plx_op t, double alpha, const plx_mat *A, double beta, plx_mat *C) {
-    int n = op_cols(A, t), k = op_rows(A, t); /* C = op(A)^T op(A) */
+    const int tr = t == PLX_TRANS; /* TRANS: C = A^T A; NO_TRANS: C = A A^T */
+    const int n = tr ? A->cols : A->rows, k = tr ? A->rows : A->cols;
     PLX_ASSERT(C->rows == n && C->cols == n && C->a != A->a);
-    la_opnd l = la_opnd_d(A->a, A->cols, t != PLX_TRANS), r = la_opnd_d(A->a, A->cols, t == PLX_TRANS);
+    la_opnd l = la_opnd_d(A->a, A->cols, tr), r = la_opnd_d(A->a, A->cols, !tr);
     la_gemm(n, n, k, alpha, &l, &r, beta, C->a, n, 1);
     la_mirror_lower(C->a, n, n);
 }
