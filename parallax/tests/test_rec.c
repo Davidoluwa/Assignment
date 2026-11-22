@@ -4,6 +4,7 @@
 #include "core/core.h"
 #include "data/lfw.h"
 #include "ops/ops.h"
+#include "rec/fuse.h"
 #include "rec/match.h"
 #include "rec/proto.h"
 #include "rec/rec.h"
@@ -544,6 +545,77 @@ TEST(supervised_separates_two_gaussians) {
     free(X);
 }
 
+/* ---- score fusion ----------------------------------------------------------------------- */
+
+TEST(logistic_regression_recovers_weights) {
+    enum { N = 20000 };
+    plx_rng r;
+    plx_rng_seed(&r, 21);
+    plx_mat Phi = plx_mat_new(N, 3);
+    int *y = PLX_NEW(int, N);
+    for (int i = 0; i < N; i++) {
+        double a = plx_rng_normal(&r), b = plx_rng_normal(&r);
+        PLX_M(&Phi, i, 0) = a;
+        PLX_M(&Phi, i, 1) = b;
+        PLX_M(&Phi, i, 2) = 1.0;
+        y[i] = plx_rng_uniform(&r) < 1.0 / (1.0 + exp(-(1.5 * a - 0.5 * b + 0.3)));
+    }
+    double w[3];
+    CHECK(plx_logreg_fit(&Phi, y, 0.0, w) == PLX_OK);
+    CHECK_NEAR(w[0], 1.5, 0.08);
+    CHECK_NEAR(w[1], -0.5, 0.05);
+    CHECK_NEAR(w[2], 0.3, 0.05);
+    plx_mat_free(&Phi);
+    free(y);
+}
+
+TEST(learned_fusion_ignores_noise_column) {
+    enum { NT = 4000, NE = 2000 };
+    plx_rng r;
+    plx_rng_seed(&r, 22);
+    plx_fuse_cols c = {.n_cols = 2};
+    plx_pair *tr = PLX_NEW(plx_pair, NT);
+    int *ye = PLX_NEW(int, NE);
+    for (int k = 0; k < 2; k++) {
+        c.train[k] = PLX_NEW(double, NT);
+        c.test[k] = PLX_NEW(double, NE);
+    }
+    /* column 0 = a noisy score of the label (scaled and shifted arbitrarily), column 1 = noise */
+    for (int i = 0; i < NT + NE; i++) {
+        int same = i % 2;
+        double s0 = 100.0 + 7.0 * (same + 0.8 * plx_rng_normal(&r)), s1 = plx_rng_normal(&r);
+        if (i < NT) {
+            tr[i].same = same;
+            c.train[0][i] = s0;
+            c.train[1][i] = s1;
+        } else {
+            ye[i - NT] = same;
+            c.test[0][i - NT] = s0;
+            c.test[1][i - NT] = s1;
+        }
+    }
+    c.train[1][3] = NAN; /* a source with nothing to say contributes nothing, not NaN */
+    const int use[2] = {0, 1};
+    double *str = PLX_NEW(double, NT), *ste = PLX_NEW(double, NE), w[3];
+    CHECK(plx_fuse_learned(&c, tr, NT, NE, use, 2, 1e-3, str, ste, w) == PLX_OK);
+    CHECK(w[0] > 1.0 && fabs(w[1]) < 0.1);
+    CHECK(isfinite(str[3]));
+    double auc_f = plx_verif_auc(ste, ye, NE), auc_0 = plx_verif_auc(c.test[0], ye, NE);
+    CHECK(auc_f > auc_0 - 0.01);
+    /* fixed weights on standardised columns: weight 1 on column 0 alone ranks like column 0 */
+    const double wf[2] = {1.0, 0.0};
+    plx_fuse_fixed(&c, NT, NE, use, 2, wf, str, ste);
+    CHECK_NEAR(plx_verif_auc(ste, ye, NE), auc_0, 1e-12);
+    free(str);
+    free(ste);
+    free(tr);
+    free(ye);
+    for (int k = 0; k < 2; k++) {
+        free(c.train[k]);
+        free(c.test[k]);
+    }
+}
+
 /* ---- protocol masks on the real pair lists ------------------------------------------- */
 
 static bool exists(const char *p) {
@@ -620,6 +692,8 @@ int main(void) {
     RUN(block_spec_parsing);
     RUN(whitening_cosine_algebra);
     RUN(supervised_separates_two_gaussians);
+    RUN(logistic_regression_recovers_weights);
+    RUN(learned_fusion_ignores_noise_column);
     RUN(protocol_masks);
     return TEST_REPORT();
 }

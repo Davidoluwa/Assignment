@@ -1,4 +1,4 @@
-// plx-deps: rec align render eval data la feat ops viz img core
+// plx-deps: rec geom align render eval data la feat ops viz img core
 /* plx_eval_tex: texture-descriptor face verification on LFW (ablation rungs L0 / L1).
  *
  *   plx_eval_tex --pack runs/main/pack [--sim runs/main/congeal/sim.plxt | --flow runs/main/flow]
@@ -26,6 +26,12 @@
  *   fails_<view>_<paradigm>.png       most confident false matches and false rejects
  *   ablation_<table>.txt              with --ablation (a separate mode: nothing else is run or
  *                                     written): a View 1 table, View 2 untouched
+ *   fusion.txt, fails_view2_fused.png with --fuse --sup METHOD [--geom DIR] (a separate mode):
+ *                                     texture + geometry-code score fusion (rung L4) on View 1
+ *                                     (and View 2 with --view2): each source's AUC, learned
+ *                                     (image-restricted) fusions with their weights, and a
+ *                                     fixed-weight fusion (--fuse-w shape,depth,aspect; --fuse-grid
+ *                                     prints the View 1 grid it is chosen from); --shape-dim M
  *
  * Descriptor flags: --blocks SPEC (see plx_desc_parse_blocks), --region x0,y0,w,h, --nosqrt, --nomirror, --mirror-weighted,
  *   --nophoto, --gamma G, --dog0 S, --dog1 S, --tau T, --ori-k K, --ori-unsigned
@@ -35,8 +41,10 @@
 #include "core/core.h"
 #include "data/lfw.h"
 #include "eval/verif.h"
+#include "geom/geom.h"
 #include "img/imgio.h"
 #include "ops/ops.h"
+#include "rec/fuse.h"
 #include "rec/match.h"
 #include "rec/proto.h"
 #include "rec/rec.h"
@@ -688,6 +696,329 @@ static void ablation(const dataset *ds, const plx_args *cmd, const char *table, 
     plx_log("wrote %s", path);
 }
 
+/* ---- geometry codes and score-level fusion (rung L4) ------------------------------------------
+ * Sources: the texture matcher (unsupervised cosine and supervised JB), the in-plane shape code
+ * through the same matcher machinery (whitened cosine; JB learnt from pairs, which can learn the
+ * expression half of the code away), and fixed pair scores from the geometry model: the
+ * depth-code likelihood ratio (geom's plx_geom_llr, which weighs each photo by its posterior
+ * precision), a pose-corrected aspect-ratio difference, and min(|yaw_a|, |yaw_b|) alone and times
+ * the depth ratio, so a learned fusion can trust depth more when both faces are turned. */
+typedef struct {
+    int    kz;
+    float *dcode;  /* [N, kz + kz^2] depth code then its precision */
+    float *pose;   /* [N, 9] */
+    float *shape;  /* [N, ks] */
+    int    ks;
+} geom_data;
+
+static double src_depth_llr(int a, int b, void *ctx) {
+    const geom_data *g = ctx;
+    int kz = g->kz, w = kz + kz * kz;
+    double c1[16], L1[256], c2[16], L2[256];
+    PLX_ASSERT(kz <= 16);
+    for (int k = 0; k < w; k++) {
+        double v1 = g->dcode[(size_t)a * w + k], v2 = g->dcode[(size_t)b * w + k];
+        if (k < kz) c1[k] = v1, c2[k] = v2;
+        else L1[k - kz] = v1, L2[k - kz] = v2;
+    }
+    return plx_geom_llr(kz, c1, L1, c2, L2);
+}
+
+/* log aspect ratio corrected for yaw foreshortening (log A = log cos(yaw) + log(person's aspect);
+ * pitch is left out: its estimate is weak). NaN where the geometry stage left log A undefined or
+ * distrusts the photo's pose. */
+static double aspect_of(const geom_data *g, int i) {
+    const float *p = g->pose + (size_t)i * POSE_COLS;
+    if (!isfinite(p[6]) || ((int)p[POSE_FLAGS] & POSE_UNTRUSTED)) return NAN;
+    return p[6] - log(cos(p[POSE_YAW]));
+}
+static double src_aspect(int a, int b, void *ctx) { return -fabs(aspect_of(ctx, a) - aspect_of(ctx, b)); }
+
+static double min_abs_yaw(const geom_data *g, int a, int b) {
+    return fmin(fabs(g->pose[(size_t)a * POSE_COLS + POSE_YAW]), fabs(g->pose[(size_t)b * POSE_COLS + POSE_YAW]));
+}
+static double src_min_yaw(int a, int b, void *ctx) { return min_abs_yaw(ctx, a, b); }
+static double src_depth_x_yaw(int a, int b, void *ctx) { return src_depth_llr(a, b, ctx) * min_abs_yaw(ctx, a, b); }
+
+static void geom_load(const dataset *ds, const char *dir, geom_data *g) {
+    char path[4096];
+    int64_t cols;
+    int n = ds->db.n_images;
+    snprintf(path, sizeof path, "%s/depth_code.plxt", dir);
+    g->dcode = load_f32(path, n, -1, &cols);
+    g->kz = (int)lround((-1.0 + sqrt(1.0 + 4.0 * cols)) / 2.0); /* cols = kz + kz^2 */
+    PLX_ASSERT(g->kz + g->kz * g->kz == cols);
+    snprintf(path, sizeof path, "%s/pose.plxt", dir);
+    g->pose = load_f32(path, n, POSE_COLS, NULL);
+    snprintf(path, sizeof path, "%s/shape_code.plxt", dir);
+    g->shape = load_f32(path, n, -1, &cols);
+    g->ks = (int)cols;
+}
+
+/* The fusions reported: column subsets of the learned (restricted) fusion. Columns are in the
+ * order of fuse_sources() below. */
+enum { C_TEX_U, C_TEX_S, C_SHAPE_U, C_SHAPE_S, C_DEPTH, C_ASPECT, C_MINYAW, C_DEPTH_YAW, N_COLS };
+typedef struct { const char *label; int n; int col[N_COLS]; } fusion_set;
+static const fusion_set FUSIONS[] = {
+    {"texture (unsup cosine, calibrated)", 1, {C_TEX_U}},
+    {"texture (cosine + JB)", 2, {C_TEX_U, C_TEX_S}},
+    {"texture + shape JB", 3, {C_TEX_U, C_TEX_S, C_SHAPE_S}},
+    {"texture + shape cosine + shape JB", 4, {C_TEX_U, C_TEX_S, C_SHAPE_U, C_SHAPE_S}},
+    {"texture + depth LLR", 3, {C_TEX_U, C_TEX_S, C_DEPTH}},
+    {"texture + aspect", 3, {C_TEX_U, C_TEX_S, C_ASPECT}},
+    {"texture + shape + depth + aspect", 5, {C_TEX_U, C_TEX_S, C_SHAPE_S, C_DEPTH, C_ASPECT}},
+    {"all + |yaw| and depth x |yaw|", 7, {C_TEX_U, C_TEX_S, C_SHAPE_S, C_DEPTH, C_ASPECT, C_MINYAW, C_DEPTH_YAW}},
+};
+enum { N_FUSIONS = sizeof FUSIONS / sizeof FUSIONS[0], FULL_FUSION = N_FUSIONS - 1 };
+/* the fixed-weight (unsupervised scoring) fusion's columns: weights chosen on View 1 */
+static const int FIXED_COLS[] = {C_TEX_U, C_SHAPE_U, C_DEPTH, C_ASPECT};
+enum { N_FIXED = sizeof FIXED_COLS / sizeof FIXED_COLS[0] };
+
+typedef struct {
+    const dataset *ds;
+    const evaluator *ev;
+    const plx_match_cfg *tex_cfg;
+    plx_match_cfg shape_cfg;
+    plx_desc_layout shape_lay;
+    plx_feats shape_feats;
+    geom_data g;
+} fusion_ctx;
+
+static int fuse_sources(fusion_ctx *fc, plx_score_source *src) {
+    src[0] = (plx_score_source){.name = "texture", .cfg = fc->tex_cfg, .lay = &fc->ev->lay, .feats = &fc->ev->all,
+                                .unsup = true, .sup = true};
+    src[1] = (plx_score_source){.name = "shape", .cfg = &fc->shape_cfg, .lay = &fc->shape_lay,
+                                .feats = &fc->shape_feats, .unsup = true, .sup = true};
+    src[2] = (plx_score_source){.name = "depth LLR", .fn = src_depth_llr, .ctx = &fc->g};
+    src[3] = (plx_score_source){.name = "aspect", .fn = src_aspect, .ctx = &fc->g};
+    src[4] = (plx_score_source){.name = "min|yaw|", .fn = src_min_yaw, .ctx = &fc->g};
+    src[5] = (plx_score_source){.name = "depth x min|yaw|", .fn = src_depth_x_yaw, .ctx = &fc->g};
+    return 6;
+}
+
+/* Everything for one view. Per split (View 1: one; View 2: ten folds): score columns, then every
+ * fusion is fitted on that split's training pairs and applied to its test pairs. */
+typedef struct {
+    int n;                              /* test pairs of the view */
+    double *col[N_COLS];                /* held-out score of every column, per test pair */
+    double *fused[N_FUSIONS], *fixed;   /* fused held-out scores */
+    double *fused_train[N_FUSIONS], *fixed_train; /* View 1 only: for the split threshold */
+    double w[PLX_VERIF_MAX_FOLDS][N_FUSIONS][N_COLS + 1];
+    int n_splits;
+    char names[N_COLS][48];
+} fusion_run;
+
+static void fusion_view(fusion_ctx *fc, bool view2, const double *wfix, fusion_run *fr) {
+    const dataset *ds = fc->ds;
+    const plx_pairs *pl = view2 ? &ds->view2 : &ds->dev_test;
+    memset(fr, 0, sizeof *fr);
+    fr->n = pl->n;
+    for (int c = 0; c < N_COLS; c++) fr->col[c] = PLX_NEW(double, pl->n);
+    for (int f = 0; f < N_FUSIONS; f++) fr->fused[f] = PLX_NEW(double, pl->n);
+    fr->fixed = PLX_NEW(double, pl->n);
+    plx_score_source src[8];
+    int ns = fuse_sources(fc, src);
+    int nsplit = view2 ? pl->n_folds : 1;
+    for (int k = 0; k < nsplit; k++) {
+        plx_rec_split s;
+        if (view2) plx_rec_split_view2(pl, &ds->db, k, &s);
+        else plx_rec_split_view1(&ds->dev_train, &ds->dev_test, &ds->db, &s);
+        double t0 = plx_now();
+        plx_fuse_cols cols;
+        if (plx_fuse_columns(src, ns, &s, &cols) != PLX_OK) plx_die("fusion: scoring split %d failed", k);
+        PLX_ASSERT(cols.n_cols == N_COLS);
+        for (int c = 0; c < N_COLS; c++) snprintf(fr->names[c], sizeof fr->names[c], "%s", cols.name[c]);
+        double *tr = PLX_NEW(double, PLX_MAX(s.n_train, 1)), *te = PLX_NEW(double, PLX_MAX(s.n_test, 1));
+        /* map split-local test pair j back to the view's pair index */
+        int *idx = PLX_NEW(int, PLX_MAX(s.n_test, 1));
+        for (int i = 0, j = 0; i < pl->n; i++)
+            if (!view2 || pl->p[i].fold == k) idx[j++] = i;
+        for (int c = 0; c < N_COLS; c++)
+            for (int j = 0; j < s.n_test; j++) fr->col[c][idx[j]] = cols.test[c][j];
+        for (int f = 0; f < N_FUSIONS; f++) {
+            if (plx_fuse_learned(&cols, s.train, s.n_train, s.n_test, FUSIONS[f].col, FUSIONS[f].n, 1e-3, tr, te,
+                                 fr->w[k][f]) != PLX_OK)
+                plx_die("fusion %d failed", f);
+            for (int j = 0; j < s.n_test; j++) fr->fused[f][idx[j]] = te[j];
+            if (!view2) {
+                fr->fused_train[f] = PLX_NEW(double, s.n_train);
+                memcpy(fr->fused_train[f], tr, sizeof(double) * s.n_train);
+            }
+        }
+        plx_fuse_fixed(&cols, s.n_train, s.n_test, FIXED_COLS, N_FIXED, wfix, tr, te);
+        for (int j = 0; j < s.n_test; j++) fr->fixed[idx[j]] = te[j];
+        if (!view2) {
+            fr->fixed_train = PLX_NEW(double, s.n_train);
+            memcpy(fr->fixed_train, tr, sizeof(double) * s.n_train);
+        }
+        plx_log("fusion %s split %d: %.1fs", view2 ? "View 2" : "View 1", k, plx_now() - t0);
+        free(tr);
+        free(te);
+        free(idx);
+        plx_fuse_cols_free(&cols);
+        plx_rec_split_free(&s);
+    }
+    fr->n_splits = nsplit;
+}
+
+static void fusion_run_free(fusion_run *fr) {
+    for (int c = 0; c < N_COLS; c++) free(fr->col[c]);
+    for (int f = 0; f < N_FUSIONS; f++) {
+        free(fr->fused[f]);
+        free(fr->fused_train[f]);
+    }
+    free(fr->fixed);
+    free(fr->fixed_train);
+}
+
+/* evaluate one score vector of a view (View 1: threshold from the training pairs' scores) */
+static void fusion_eval(const dataset *ds, bool view2, const double *score, const double *train_score,
+                        plx_verif_report *r) {
+    int rc = view2 ? plx_verif_evaluate(ds->view2.p, ds->view2.n, score, r)
+                   : plx_verif_split(ds->dev_train.p, ds->dev_train.n, train_score, ds->dev_test.p, ds->dev_test.n,
+                                     score, r);
+    if (rc != PLX_OK) plx_die("fusion evaluation failed");
+}
+
+static void fusion_report(fusion_ctx *fc, bool view2, const fusion_run *fr, const double *wfix, FILE *f) {
+    const dataset *ds = fc->ds;
+    const plx_pairs *pl = view2 ? &ds->view2 : &ds->dev_test;
+    const char *view = view2 ? "View 2" : "View 1";
+    int *same = PLX_NEW(int, pl->n);
+    for (int i = 0; i < pl->n; i++) same[i] = pl->p[i].same;
+    fprintf(f, "## %s: each source alone (held-out scores; AUC is threshold-free)\n", view);
+    for (int c = 0; c < N_COLS; c++) {
+        double *s = PLX_NEW(double, pl->n);
+        for (int i = 0; i < pl->n; i++) s[i] = isfinite(fr->col[c][i]) ? fr->col[c][i] : -INFINITY;
+        fprintf(f, "  %-18s AUC %.4f", fr->names[c], plx_verif_auc(s, same, pl->n));
+        if (c == C_DEPTH) { /* the depth code only speaks when both photos are turned */
+            int n10 = 0;
+            double *s10 = PLX_NEW(double, pl->n);
+            int *y10 = PLX_NEW(int, pl->n);
+            for (int i = 0; i < pl->n; i++)
+                if (min_abs_yaw(&fc->g, pl->p[i].a, pl->p[i].b) > 10.0 * M_PI / 180.0) {
+                    s10[n10] = s[i];
+                    y10[n10++] = same[i];
+                }
+            fprintf(f, "   (both |yaw| > 10 deg: AUC %.4f over %d pairs)", plx_verif_auc(s10, y10, n10), n10);
+            free(s10);
+            free(y10);
+        }
+        fprintf(f, "\n");
+        free(s);
+    }
+    fprintf(f, "\n## %s: learned fusion (logistic regression on standardised columns, fitted on each split's\n"
+               "## training pairs; supervised columns out-of-fold) = image-restricted\n", view);
+    for (int g = 0; g < N_FUSIONS; g++) {
+        plx_verif_report r;
+        fusion_eval(ds, view2, fr->fused[g], view2 ? NULL : fr->fused_train[g], &r);
+        char label[160];
+        snprintf(label, sizeof label, "%s fusion: %s", view, FUSIONS[g].label);
+        plx_verif_print(f, label, &r);
+        fprintf(f, "  weights (standardised; mean +- sd over %d splits):", fr->n_splits);
+        for (int j = 0; j <= FUSIONS[g].n; j++) {
+            double m = 0, ss = 0;
+            for (int k = 0; k < fr->n_splits; k++) m += fr->w[k][g][j];
+            m /= fr->n_splits;
+            for (int k = 0; k < fr->n_splits; k++) ss += (fr->w[k][g][j] - m) * (fr->w[k][g][j] - m);
+            fprintf(f, "  %s %+.3f +- %.3f", j < FUSIONS[g].n ? fr->names[FUSIONS[g].col[j]] : "bias", m,
+                    fr->n_splits > 1 ? sqrt(ss / (fr->n_splits - 1)) : 0.0);
+        }
+        fprintf(f, "\n\n");
+    }
+    plx_verif_report r;
+    fusion_eval(ds, view2, fr->fixed, view2 ? NULL : fr->fixed_train, &r);
+    char label[160];
+    snprintf(label, sizeof label, "%s unsupervised scoring, View-1-selected fusion weights", view);
+    fprintf(f, "## %s: fixed-weight fusion of standardised unsupervised / fixed columns; weights", view);
+    for (int j = 0; j < N_FIXED; j++) fprintf(f, " %s %g", fr->names[FIXED_COLS[j]], wfix[j]);
+    fprintf(f, " (chosen on View 1 with labels: NOT label-free)\n");
+    plx_verif_print(f, label, &r);
+    fprintf(f, "\n");
+    fflush(f);
+    free(same);
+}
+
+/* View 1 grid for the fixed-weight fusion: texture weight 1, the others from small grids */
+static void fusion_grid(fusion_ctx *fc, const fusion_run *fr1, FILE *f) {
+    static const double gs[] = {0, 0.1, 0.2, 0.3, 0.5}, gd[] = {0, 0.05, 0.1, 0.2, 0.3}, ga[] = {0, 0.05, 0.1, 0.2};
+    plx_rec_split s;
+    plx_rec_split_view1(&fc->ds->dev_train, &fc->ds->dev_test, &fc->ds->db, &s);
+    plx_score_source src[8];
+    int ns = fuse_sources(fc, src);
+    plx_fuse_cols cols;
+    if (plx_fuse_columns(src, ns, &s, &cols) != PLX_OK) plx_die("fusion grid: scoring failed");
+    double *tr = PLX_NEW(double, s.n_train), *te = PLX_NEW(double, s.n_test);
+    fprintf(f, "## View 1 grid for the fixed-weight fusion (texture/u weight 1): shape/u depth aspect -> acc AUC\n");
+    for (size_t i = 0; i < sizeof gs / sizeof gs[0]; i++)
+        for (size_t j = 0; j < sizeof gd / sizeof gd[0]; j++)
+            for (size_t k = 0; k < sizeof ga / sizeof ga[0]; k++) {
+                double w[N_FIXED] = {1.0, gs[i], gd[j], ga[k]};
+                plx_fuse_fixed(&cols, s.n_train, s.n_test, FIXED_COLS, N_FIXED, w, tr, te);
+                plx_verif_report r;
+                fusion_eval(fc->ds, false, te, tr, &r);
+                fprintf(f, "  %.2f %.2f %.2f  ->  %.4f %.4f\n", gs[i], gd[j], ga[k], r.mean_acc, r.auc);
+            }
+    fprintf(f, "\n");
+    (void)fr1;
+    free(tr);
+    free(te);
+    plx_fuse_cols_free(&cols);
+    plx_rec_split_free(&s);
+}
+
+static void fusion_mode(const dataset *ds, const evaluator *ev, const plx_match_cfg *tex_cfg, const plx_args *a,
+                        const char *out) {
+    fusion_ctx fc = {.ds = ds, .ev = ev, .tex_cfg = tex_cfg};
+    geom_load(ds, plx_arg_str(a, "geom", "runs/main/geom"), &fc.g);
+    /* the shape code through the same matcher: whitened (it already is) cosine, and JB from pairs */
+    fc.shape_lay = (plx_desc_layout){0};
+    plx_desc_layout_append_code(&fc.shape_lay, fc.g.ks);
+    fc.shape_feats = (plx_feats){.n = ds->db.n_images, .d = fc.g.ks, .n_cells = 1, .x = fc.g.shape};
+    fc.shape_cfg = plx_match_default();
+    fc.shape_cfg.pca_dim = fc.g.ks;
+    fc.shape_cfg.sup = PLX_SUP_JB;
+    fc.shape_cfg.sup_pca = fc.g.ks;
+    fc.shape_cfg.sup_dim = (int)plx_arg_int(a, "shape-dim", 16);
+    double wfix[N_FIXED] = {1.0, 0.0, 0.0, 0.0};
+    const char *ws = plx_arg_str(a, "fuse-w", NULL);
+    if (ws && sscanf(ws, "%lf,%lf,%lf", &wfix[1], &wfix[2], &wfix[3]) != 3)
+        plx_die("--fuse-w expects 3 weights: shape/u, depth, aspect (texture/u is 1)");
+
+    char path[4096];
+    snprintf(path, sizeof path, "%s/fusion.txt", out);
+    FILE *f = fopen(path, "w");
+    if (!f) plx_die("cannot write %s", path);
+    char mdesc[512];
+    plx_match_describe(tex_cfg, true, mdesc, sizeof mdesc);
+    fprintf(f, "# score-level fusion of texture and geometry (rung L4)\n# texture matcher: %s\n# shape matcher: "
+               "%d-dim code, whitened cosine + JB (%d pair-LDA dims)\n# depth code: %d dims with per-photo precision\n\n",
+            mdesc, fc.g.ks, fc.shape_cfg.sup_dim, fc.g.kz);
+    fusion_run fr;
+    fusion_view(&fc, false, wfix, &fr);
+    fusion_report(&fc, false, &fr, wfix, f);
+    if (plx_arg_flag(a, "fuse-grid")) fusion_grid(&fc, &fr, f);
+    fusion_run_free(&fr);
+    if (plx_arg_flag(a, "view2")) {
+        fusion_view(&fc, true, wfix, &fr);
+        fusion_report(&fc, true, &fr, wfix, f);
+        double *thr = PLX_NEW(double, ds->view2.n);
+        plx_verif_report r;
+        fusion_eval(ds, true, fr.fused[FULL_FUSION], NULL, &r);
+        for (int i = 0; i < ds->view2.n; i++) thr[i] = r.fold_thr[ds->view2.p[i].fold];
+        if (ev->png)
+            failure_montage(ds, ev->dp, ev->to, ds->view2.p, ds->view2.n, fr.fused[FULL_FUSION], thr, out,
+                            "fails_view2_fused.png");
+        free(thr);
+        fusion_run_free(&fr);
+    }
+    fclose(f);
+    plx_log("wrote %s", path);
+    free(fc.g.dcode);
+    free(fc.g.pose);
+    free(fc.g.shape);
+}
+
 int main(int argc, char **argv) {
     plx_args a = {argc, argv};
     const char *out = plx_arg_str(&a, "out", NULL);
@@ -710,6 +1041,18 @@ int main(int argc, char **argv) {
     float *x = NULL, *cw = NULL;
     descriptors(&ds, &dp, &to, out, true, &x, &cw);
     plx_desc_layout lay = layout_of(&ds, &dp);
+
+    if (plx_arg_flag(&a, "fuse")) { /* a mode of its own: writes fusion.txt, leaves report.txt alone */
+        evaluator fev = {.ds = &ds, .dp = &dp, .to = &to, .lay = lay,
+                         .all = {.n = ds.db.n_images, .d = lay.d, .n_cells = lay.n_cells, .x = x, .cw = cw},
+                         .out = out, .png = !plx_arg_flag(&a, "no-png")};
+        if (mc.score != PLX_SCORE_EMBED || mc.sup == PLX_SUP_NONE) plx_die("--fuse needs an embedding matcher with --sup");
+        fusion_mode(&ds, &fev, &mc, &a, out);
+        free(x);
+        free(cw);
+        dataset_close(&ds);
+        return 0;
+    }
 
     char path[4096];
     snprintf(path, sizeof path, "%s/report.txt", out);
