@@ -46,32 +46,32 @@ static inline void taps_cubic(float x, int n, size_t stride, axis_taps *t) {
     t->d[3] = 0.5f * (3.0f * f2 - 2.0f * f);
 }
 
+/* Pairwise sums: four independent products instead of one serial chain of FMAs, which is
+ * what keeps the 4x4 bicubic case from being latency bound. */
+static inline float dot(const float *w, const float *s, int n) {
+    return n == 2 ? w[0] * s[0] + w[1] * s[1] : (w[0] * s[0] + w[1] * s[1]) + (w[2] * s[2] + w[3] * s[3]);
+}
+
 /* Tensor-product evaluation of every channel; n (2 or 4) is a constant at each call site so
- * the loops unroll. The x-pass is shared by the value and d/dy, the x-derivative pass by d/dx. */
+ * the loops unroll. The x-pass rows a[] feed both the value and d/dy, the x-derivative rows
+ * b[] feed d/dx. */
 static inline void eval_channels(const plx_img *im, const axis_taps *tx, const axis_taps *ty, int n,
                                  float *val, float *grad) {
     size_t plane = (size_t)im->w * im->h;
     for (int k = 0; k < im->c; k++) {
         const float *p = im->px + (size_t)k * plane;
-        float v = 0.0f, gx = 0.0f, gy = 0.0f;
+        float a[4], b[4];
         for (int r = 0; r < n; r++) {
             const float *row = p + ty->off[r];
-            float a = 0.0f, b = 0.0f;
-            for (int q = 0; q < n; q++) {
-                float s = row[tx->off[q]];
-                a += tx->w[q] * s;
-                if (grad) b += tx->d[q] * s;
-            }
-            v += ty->w[r] * a;
-            if (grad) {
-                gx += ty->w[r] * b;
-                gy += ty->d[r] * a;
-            }
+            float s[4];
+            for (int q = 0; q < n; q++) s[q] = row[tx->off[q]];
+            a[r] = dot(tx->w, s, n);
+            b[r] = dot(tx->d, s, n);
         }
-        val[k] = v;
+        val[k] = dot(ty->w, a, n);
         if (grad) {
-            grad[2 * k] = gx;
-            grad[2 * k + 1] = gy;
+            grad[2 * k] = dot(ty->w, b, n);
+            grad[2 * k + 1] = dot(ty->d, a, n);
         }
     }
 }

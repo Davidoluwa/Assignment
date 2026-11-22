@@ -18,6 +18,16 @@ void plx_gauss_kernel(float sigma, float *k) {
     for (int i = -r; i <= r; i++) k[i + r] = (float)(exp(-(double)i * i * inv2s2) / sum);
 }
 
+/* t[x] += k * r[x]. Written as fixed 8-wide blocks: GCC's -O2 cost model only vectorises loops
+ * whose trip count is a known multiple of the vector width, and this is the inner loop of
+ * every filter here (a 2-4x difference). */
+static inline void axpy(float *restrict t, const float *restrict r, float k, int n) {
+    int x = 0;
+    for (; x + 8 <= n; x += 8)
+        for (int q = 0; q < 8; q++) t[x + q] += k * r[x + q];
+    for (; x < n; x++) t[x] += k * r[x];
+}
+
 /* Correlates every channel with kx along x then ky along y (replicate border):
  *   dst(x, y) = sum_j ky[j] sum_i kx[i] src(x + i - rx, y + j - ry).
  * Both passes keep the inner loop running along a row so it vectorises; the horizontal result
@@ -38,22 +48,14 @@ static void sep_filter(const plx_img *src, plx_img *dst, const float *kx, int rx
             memcpy(row + rx, sr, sizeof(float) * (size_t)w);
             float *t = tmp + (size_t)y * w;
             for (int x = 0; x < w; x++) t[x] = kx[0] * row[x];
-            for (int i = 1; i <= 2 * rx; i++) {
-                const float *ri = row + i;
-                float ki = kx[i];
-                for (int x = 0; x < w; x++) t[x] += ki * ri[x];
-            }
+            for (int i = 1; i <= 2 * rx; i++) axpy(t, row + i, kx[i], w);
         }
         float *d = plx_img_chan(dst, k);
         for (int y = 0; y < h; y++) {
             float *dr = d + (size_t)y * w;
             const float *t0 = tmp + (size_t)PLX_CLAMP(y - ry, 0, h - 1) * w;
             for (int x = 0; x < w; x++) dr[x] = ky[0] * t0[x];
-            for (int j = 1; j <= 2 * ry; j++) {
-                const float *tj = tmp + (size_t)PLX_CLAMP(y + j - ry, 0, h - 1) * w;
-                float kj = ky[j];
-                for (int x = 0; x < w; x++) dr[x] += kj * tj[x];
-            }
+            for (int j = 1; j <= 2 * ry; j++) axpy(dr, tmp + (size_t)PLX_CLAMP(y + j - ry, 0, h - 1) * w, ky[j], w);
         }
     }
     free(row);

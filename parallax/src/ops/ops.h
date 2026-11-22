@@ -40,8 +40,8 @@ void plx_blur(const plx_img *src, plx_img *dst, float sigma);
  * gx = d/dx, gy = d/dy (y down), per channel, replicate border; gx/gy must have src's shape.
  * Both filters are normalised so a linear ramp a*x + b*y gives exactly (a, b) away from the
  * border, and the Gaussian one is exact for any quadratic (its derivative taps are
- * antisymmetric and the smoothing taps symmetric). Alias-safe for gx == src or gy == src
- * is NOT supported: gx, gy and src must be three distinct images. */
+ * antisymmetric and the smoothing taps symmetric). NOT alias-safe: src, gx and gy must be
+ * three distinct images. */
 void plx_gradient_gauss(const plx_img *src, float sigma, plx_img *gx, plx_img *gy); /* sigma > 0 */
 void plx_gradient_scharr(const plx_img *src, plx_img *gx, plx_img *gy);  /* [-1 0 1]/2 x [3 10 3]/16 */
 
