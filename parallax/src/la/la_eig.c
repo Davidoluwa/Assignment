@@ -1,13 +1,15 @@
 /* Symmetric eigendecomposition: Householder tridiagonalisation + implicit-shift QL.
  *
  * Cost structure for n in the thousands, and how it is handled:
- *   - Tridiagonalisation (4/3 n^3) and forming Q^T (4/3 n^3) are level-2 sweeps over the trailing
- *     matrix; rows are contiguous, so each step is a set of independent row dot/axpy operations,
- *     threaded over rows.
+ *   - Tridiagonalisation (4/3 n^3) is level-2 and memory bound. Rows are contiguous, so each step
+ *     is one independent "rank-2 update, then dot with the next reflector" per row, threaded over
+ *     rows: fusing step k's update with step k+1's matrix-vector product streams the trailing
+ *     matrix once per step instead of twice.
+ *   - Forming Q^T (4/3 n^3) groups the reflectors into compact-WY blocks and runs on gemm.
  *   - QL itself is O(n^2) on (d, e). Accumulating its ~n^2 Givens rotations into the eigenvectors
  *     is the 6 n^3 hot spot, and applying each sweep directly would stream the whole n x n matrix
  *     through memory ~2n times. But the rotations never depend on the vectors, so they are recorded
- *     and replayed later on narrow column slices of Z^T that stay in L2: every slice sees the whole
+ *     and replayed later on narrow column slices of Z^T that stay in L1: every slice sees the whole
  *     rotation sequence, slices are independent (threaded), and each rotation touches two
  *     contiguous row segments, which vectorises. */
 #include "la/la_internal.h"
@@ -20,52 +22,60 @@
 typedef struct {
     double *W;
     int n, k;
-    const double *v; /* length L = n - k - 1, v[0] = 1 */
+    const double *vp, *wp; /* pending update S -= vp wp^T + wp vp^T, indexed from k (NULL: none) */
+    const double *v;       /* reflector k, indexed from k+1, v[0] = 1 */
     double *p, tau;
 } tri_job;
 
-static void tri_symv_row(int64_t i, int tid, void *ctx) {
-    tri_job *t = ctx;
+/* Row k+1+r: apply step k-1's rank-2 update to columns k+1.., then p_r = tau (row . v). */
+static void tri_row(int64_t r, int tid, void *ctx) {
+    const tri_job *t = ctx;
     const int L = t->n - t->k - 1, o = t->k + 1;
-    t->p[i] = t->tau * la_dot(t->W + (size_t)(o + i) * t->n + o, t->v, (size_t)L);
-}
-
-static void tri_rank2_row(int64_t i, int tid, void *ctx) { /* p now holds w */
-    tri_job *t = ctx;
-    const int L = t->n - t->k - 1, o = t->k + 1;
-    double *row = t->W + (size_t)(o + i) * t->n + o;
-    la_axpy(row, -t->v[i], t->p, (size_t)L);
-    la_axpy(row, -t->p[i], t->v, (size_t)L);
+    double *row = t->W + (size_t)(o + r) * t->n + o;
+    if (t->vp) {
+        la_axpy(row, -t->vp[r + 1], t->wp + 1, (size_t)L);
+        la_axpy(row, -t->wp[r + 1], t->vp + 1, (size_t)L);
+    }
+    t->p[r] = t->tau == 0 ? 0.0 : t->tau * la_dot(row, t->v, (size_t)L);
 }
 
 /* W (n x n, full symmetric) -> d, e (e[i] couples i and i+1, e[n-1] = 0) with Q^T W Q tridiagonal,
- * Q = H_0 ... H_{n-3}. Reflector k is stored in row k, entries k+1..n-1 (leading 1 explicit). */
+ * Q = H_0 ... H_{n-3}. Reflector k is stored in row k, entries k+1..n-1 (leading 1 explicit).
+ * Step k: H S H = S - v w^T - w v^T with p = tau S v, w = p - (tau/2)(p.v) v, where S is the
+ * trailing block. Step k-1's update is deferred into step k's pass over rows k+1..; only row k,
+ * which defines reflector k, gets it up front. */
 static void tridiagonalise(double *W, int n, double *d, double *e, double *tau) {
-    double *p = plx_malloc(sizeof(double) * n);
+    double *wbuf[2] = {plx_malloc(sizeof(double) * n), plx_malloc(sizeof(double) * n)};
+    const double *vp = NULL, *wp = NULL;
     for (int k = 0; k < n - 2; k++) {
         const int L = n - k - 1;
         double *x = W + (size_t)k * n + k + 1;
+        if (vp) {
+            la_axpy(x - 1, -vp[0], wp, (size_t)L + 1);
+            la_axpy(x - 1, -wp[0], vp, (size_t)L + 1);
+        }
         d[k] = W[(size_t)k * n + k];
         double xnorm = la_norm_strided(x + 1, 1, L - 1);
         tau[k] = 0;
-        if (xnorm == 0) {
-            e[k] = x[0];
-            x[0] = 1;
-            continue;
+        e[k] = x[0];
+        if (xnorm != 0) {
+            double alpha = x[0], beta = -copysign(hypot(alpha, xnorm), alpha);
+            double scale = 1.0 / (alpha - beta);
+            for (int i = 1; i < L; i++) x[i] *= scale;
+            e[k] = beta;
+            tau[k] = (beta - alpha) / beta;
         }
-        double alpha = x[0], beta = -copysign(hypot(alpha, xnorm), alpha);
-        double scale = 1.0 / (alpha - beta);
-        for (int i = 1; i < L; i++) x[i] *= scale;
         x[0] = 1;
-        e[k] = beta;
-        tau[k] = (beta - alpha) / beta;
-        /* H S H = S - v w^T - w v^T with p = tau S v, w = p - (tau/2)(p.v) v */
-        tri_job t = {W, n, k, x, p, tau[k]};
-        la_par_for(L, 2.0 * L, tri_symv_row, &t);
-        double K = 0.5 * tau[k] * la_dot(p, x, (size_t)L);
-        la_axpy(p, -K, x, (size_t)L);
-        la_par_for(L, 4.0 * L, tri_rank2_row, &t);
+        double *p = wbuf[k & 1];
+        tri_job t = {W, n, k, vp, wp, x, p, tau[k]};
+        la_par_for(L, 6.0 * L, tri_row, &t);
+        la_axpy(p, -0.5 * tau[k] * la_dot(p, x, (size_t)L), x, (size_t)L); /* p <- w */
+        vp = x;
+        wp = p;
     }
+    if (vp) /* the last update reaches only the trailing 2 x 2 block */
+        for (int a = 0; a < 2; a++)
+            for (int b = 0; b < 2; b++) W[(size_t)(n - 2 + a) * n + n - 2 + b] -= vp[a] * wp[b] + wp[a] * vp[b];
     if (n >= 2) {
         d[n - 2] = W[(size_t)(n - 2) * n + n - 2];
         e[n - 2] = W[(size_t)(n - 1) * n + n - 2];
@@ -73,34 +83,39 @@ static void tridiagonalise(double *W, int n, double *d, double *e, double *tau) 
     }
     d[n - 1] = W[(size_t)(n - 1) * n + n - 1];
     e[n - 1] = 0;
-    free(p);
+    free(wbuf[0]);
+    free(wbuf[1]);
 }
 
-typedef struct {
-    const double *W, *tau;
-    double *Zt;
-    int n, k;
-} formq_job;
+enum { WY_NB = 32 };
 
-static void formq_row(int64_t r, int tid, void *ctx) {
-    formq_job *f = ctx;
-    const int o = f->k + 1, L = f->n - o;
-    const double *v = f->W + (size_t)f->k * f->n + o;
-    double *row = f->Zt + (size_t)(o + r) * f->n + o;
-    la_axpy(row, -f->tau[f->k] * la_dot(row, v, (size_t)L), v, (size_t)L);
-}
-
-/* Zt = Q^T = H_{n-3} ... H_0, accumulated as Zt <- Zt H_k for k descending. Before step k, Zt
- * differs from I only in rows/cols >= k+2, so the step touches rows and columns k+1.. only, and
- * as a right-multiplication it is one dot + axpy per (contiguous) row. */
-static void form_qt(const double *W, const double *tau, int n, double *Zt) {
-    memset(Zt, 0, sizeof(double) * (size_t)n * n);
-    for (int i = 0; i < n; i++) Zt[(size_t)i * n + i] = 1;
-    for (int k = n - 3; k >= 0; k--) {
-        if (tau[k] == 0) continue;
-        formq_job f = {W, tau, Zt, n, k};
-        la_par_for(n - k - 1, 4.0 * (n - k - 1), formq_row, &f);
+/* Zt = Q^T = H_{n-3} ... H_0, built block by block from the last reflectors to the first. For
+ * the block k0..k1-1, H_{k0} ... H_{k1-1} = I - V T V^T, so Zt <- Zt H_{k1-1} ... H_{k0} =
+ * Zt (I - V T^T V^T), three gemms. Before the block, Zt differs from I only in rows/cols > k1,
+ * so only the trailing (n-k0-1)^2 block (where V is nonzero) is touched. */
+static void form_qt(const double *W, const double *tau, int n, double *Zt, int64_t ldz) {
+    memset(Zt, 0, sizeof(double) * (size_t)n * ldz);
+    for (int i = 0; i < n; i++) Zt[(size_t)i * ldz + i] = 1;
+    const int nr = n - 2; /* reflectors 0..n-3 */
+    if (nr <= 0) return;
+    const int mm_max = n - 1;
+    double *V = plx_malloc(sizeof(double) * (size_t)mm_max * WY_NB), *T = plx_malloc(sizeof(double) * WY_NB * WY_NB);
+    double *M = plx_malloc(sizeof(double) * (size_t)mm_max * WY_NB), *M2 = plx_malloc(sizeof(double) * (size_t)mm_max * WY_NB);
+    for (int k0 = (nr - 1) / WY_NB * WY_NB; k0 >= 0; k0 -= WY_NB) {
+        const int jb = PLX_MIN(WY_NB, nr - k0), mm = n - k0 - 1;
+        for (int r = 0; r < mm; r++) /* V[r][c] = v_{k0+c} at global index k0+1+r */
+            for (int c = 0; c < jb; c++)
+                V[r * jb + c] = r < c ? 0.0 : r == c ? 1.0 : W[(size_t)(k0 + c) * n + k0 + 1 + r];
+        la_wy_t(V, mm, jb, tau + k0, T, WY_NB);
+        double *Z = Zt + (size_t)(k0 + 1) * ldz + k0 + 1;
+        la_dgemm(0, 0, mm, jb, mm, 1.0, Z, ldz, V, jb, 0.0, M, jb);
+        la_dgemm(0, 1, mm, jb, jb, 1.0, M, jb, T, WY_NB, 0.0, M2, jb);
+        la_dgemm(0, 1, mm, mm, jb, -1.0, M2, jb, V, jb, 1.0, Z, ldz);
     }
+    free(V);
+    free(T);
+    free(M);
+    free(M2);
 }
 
 /* ---- QL with recorded rotations ------------------------------------------------------------ */
@@ -110,25 +125,41 @@ typedef struct {
     int i; /* rotates rows i and i+1 of Zt */
 } rot;
 
+/* Slices are one cache line (8 doubles) wide: a slice of Zt is then 8n doubles (16 KB at
+ * n = 2000) and stays in L1 while the rotation list streams past it from L2/L3; wider slices
+ * measured 1.2-1.8x slower. Zt rows are padded to a multiple of 8 doubles and the array is
+ * 64-byte aligned, so every slice is a column of whole cache lines and threads never share one. */
+enum { ROT_SLICE = 8 };
 typedef struct {
     rot *r;
     size_t n, cap;
     double *Zt;
-    int dim, slice;
+    int64_t ldz;
+    int dim;
 } rot_log;
+
+static inline void rot_line(double *restrict x, double *restrict y, double c, double s) {
+    for (int j = 0; j < ROT_SLICE; j++) {
+        double xj = x[j], yj = y[j];
+        x[j] = c * xj - s * yj;
+        y[j] = s * xj + c * yj;
+    }
+}
 
 static void rot_apply_slice(int64_t b, int tid, void *ctx) {
     const rot_log *L = ctx;
-    const int c0 = (int)b * L->slice, w = PLX_MIN(L->slice, L->dim - c0);
+    const int c0 = (int)b * ROT_SLICE, w = PLX_MIN(ROT_SLICE, L->dim - c0);
+    double *base = L->Zt + c0;
     for (size_t q = 0; q < L->n; q++) {
-        double *x = L->Zt + (size_t)L->r[q].i * L->dim + c0;
-        la_rot(x, x + L->dim, (size_t)w, L->r[q].c, L->r[q].s);
+        double *x = base + (size_t)L->r[q].i * L->ldz;
+        if (w == ROT_SLICE) rot_line(x, x + L->ldz, L->r[q].c, L->r[q].s);
+        else la_rot(x, x + L->ldz, (size_t)w, L->r[q].c, L->r[q].s);
     }
 }
 
 static void rot_flush(rot_log *L) {
-    int nb = (L->dim + L->slice - 1) / L->slice;
-    la_par_for(nb, 6.0 * (double)L->n * L->slice, rot_apply_slice, L);
+    int nb = (L->dim + ROT_SLICE - 1) / ROT_SLICE;
+    la_par_for(nb, 6.0 * (double)L->n * ROT_SLICE, rot_apply_slice, L);
     L->n = 0;
 }
 
@@ -204,14 +235,16 @@ int plx_eigh(const plx_mat *A, double *w, plx_mat *V) {
 
     rot_log log = {0};
     double *Zt = NULL;
+    const int64_t ldz = (n + 7) / 8 * 8;
     if (V) {
-        Zt = plx_malloc(sizeof(double) * (size_t)n * n);
-        form_qt(W, tau, n, Zt);
+        Zt = aligned_alloc(64, sizeof(double) * (size_t)n * ldz);
+        if (!Zt) plx_die("out of memory (%d x %d eigenvectors)", n, n);
+        form_qt(W, tau, n, Zt, ldz);
         log.cap = (size_t)1 << 21;
         log.r = plx_malloc(sizeof(rot) * log.cap);
         log.Zt = Zt;
+        log.ldz = ldz;
         log.dim = n;
-        log.slice = PLX_CLAMP(65536 / n / 8 * 8, 8, 256); /* n x slice doubles ~ 512 KB: L2 resident */
     }
     int rc = tridiag_ql(d, e, n, V ? &log : NULL);
     int *idx = plx_malloc(sizeof(int) * n);
@@ -222,7 +255,7 @@ int plx_eigh(const plx_mat *A, double *w, plx_mat *V) {
     if (V && rc == PLX_OK) {
         rot_flush(&log);
         for (int j = 0; j < n; j++)
-            for (int i = 0; i < n; i++) PLX_M(V, i, j) = Zt[(size_t)idx[j] * n + i];
+            for (int i = 0; i < n; i++) PLX_M(V, i, j) = Zt[(size_t)idx[j] * ldz + i];
         la_fix_signs(V->a, n, n, NULL, 0);
     }
     free(log.r);

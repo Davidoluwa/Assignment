@@ -156,22 +156,12 @@ int plx_spd_inverse(const plx_mat *A, plx_mat *Ainv) {
 
 /* ---- LU --------------------------------------------------------------------------------- */
 
-typedef struct {
-    double *a;
-    int n, k;
-} lu_job;
+enum { LU_NB = 64 };
 
-static void lu_eliminate_row(int64_t r, int tid, void *ctx) {
-    const lu_job *j = ctx;
-    const int n = j->n, k = j->k;
-    double *ak = j->a + (size_t)k * n, *ai = j->a + (size_t)(k + 1 + r) * n;
-    double l = ai[k] / ak[k];
-    ai[k] = l;
-    if (l != 0) la_axpy(ai + k + 1, -l, ak + k + 1, (size_t)(n - k - 1));
-}
-
-/* Right-looking elimination; rows are contiguous in row-major storage, so the row swap is a
- * memcpy-speed operation and the trailing update is one independent axpy per row (threaded). */
+/* Blocked right-looking LU with partial pivoting. A panel of LU_NB columns is factored with
+ * row-major-friendly elimination (whole-row swaps, so the rows left and right of the panel are
+ * permuted along, as LAPACK's laswp would); then U12 = L11^-1 A12 (triangular solve) and the
+ * trailing A22 -= L21 U12 runs on the packed gemm, which is where the n^3 flops go. */
 int plx_lu(plx_mat *A, int *piv) {
     const int n = A->rows;
     PLX_ASSERT(A->cols == n);
@@ -180,21 +170,31 @@ int plx_lu(plx_mat *A, int *piv) {
     const double tol = n * DBL_EPSILON * amax;
     int rc = PLX_OK;
     double *tmp = plx_malloc(sizeof(double) * (size_t)n);
-    for (int k = 0; k < n; k++) {
-        int p = k;
-        for (int i = k + 1; i < n; i++)
-            if (fabs(a[(size_t)i * n + k]) > fabs(a[(size_t)p * n + k])) p = i;
-        piv[k] = p;
-        if (p != k) {
-            memcpy(tmp, a + (size_t)k * n, sizeof(double) * n);
-            memcpy(a + (size_t)k * n, a + (size_t)p * n, sizeof(double) * n);
-            memcpy(a + (size_t)p * n, tmp, sizeof(double) * n);
+    for (int k0 = 0; k0 < n; k0 += LU_NB) {
+        const int kb = PLX_MIN(LU_NB, n - k0), k1 = k0 + kb, n2 = n - k1;
+        for (int k = k0; k < k1; k++) {
+            int p = k;
+            for (int i = k + 1; i < n; i++)
+                if (fabs(a[(size_t)i * n + k]) > fabs(a[(size_t)p * n + k])) p = i;
+            piv[k] = p;
+            if (p != k) {
+                memcpy(tmp, a + (size_t)k * n, sizeof(double) * n);
+                memcpy(a + (size_t)k * n, a + (size_t)p * n, sizeof(double) * n);
+                memcpy(a + (size_t)p * n, tmp, sizeof(double) * n);
+            }
+            const double *ak = a + (size_t)k * n;
+            if (!(fabs(ak[k]) > tol)) rc = PLX_ESINGULAR;
+            if (ak[k] == 0) continue; /* the whole column below is zero too: nothing to eliminate */
+            for (int i = k + 1; i < n; i++) {
+                double *ai = a + (size_t)i * n, l = ai[k] / ak[k];
+                ai[k] = l;
+                if (l != 0) la_axpy(ai + k + 1, -l, ak + k + 1, (size_t)(k1 - k - 1));
+            }
         }
-        double pivot = a[(size_t)k * n + k];
-        if (!(fabs(pivot) > tol)) rc = PLX_ESINGULAR;
-        if (pivot == 0) continue; /* the whole column below is zero too: nothing to eliminate */
-        lu_job j = {a, n, k};
-        la_par_for(n - k - 1, 2.0 * (n - k), lu_eliminate_row, &j);
+        if (n2 == 0) break;
+        double *A11 = a + (size_t)k0 * n + k0;
+        la_trsm(1, 0, 1, kb, A11, n, A11 + kb, n2, n);
+        la_dgemm(0, 0, n2, n2, kb, -1.0, A11 + (size_t)kb * n, n, A11 + kb, n, 1.0, A11 + (size_t)kb * n + kb, n);
     }
     free(tmp);
     return rc;

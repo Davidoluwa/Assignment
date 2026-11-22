@@ -10,7 +10,10 @@
 
 /* Property tests for src/la. Every decomposition is checked by what defines it (reconstruction,
  * orthogonality, ordering) and against an independent route; tolerances are stated relative to
- * eps = 2.2e-16 and the matrix size. PLX_SLOW_TESTS=1 adds the scale/speed runs. */
+ * eps = 2.2e-16 and the matrix size.
+ *   PLX_SLOW_TESTS=1  adds the scale/speed runs (gemm 1000^3, eigh 1000/2000, SVD 2000x900,
+ *                     randomised PCA 13000 x 20000 float, k = 300) and prints their timings.
+ *   PLX_LA_ORACLE=DIR compares against numpy/LAPACK answers written by tools/oracle/la_oracle.py. */
 
 #define EPS DBL_EPSILON
 
@@ -1204,6 +1207,109 @@ TEST(pca_routes_agree) {
     plx_mat_free(&Vt); plx_mat_free(&B);
 }
 
+/* ---- numpy oracle (PLX_LA_ORACLE=dir, data from tools/oracle/la_oracle.py) ------------------- */
+
+static const char *g_oracle_dir;
+
+static plx_tensor oracle_tensor(const char *name) {
+    char path[512];
+    snprintf(path, sizeof path, "%s/%s.plxt", g_oracle_dir, name);
+    plx_tensor t;
+    if (plx_tensor_load(path, &t) != PLX_OK) plx_die("oracle file %s missing: run tools/oracle/la_oracle.py", path);
+    return t;
+}
+
+static plx_mat oracle_mat(const char *name) { /* f64, 1-D loads as a column */
+    plx_tensor t = oracle_tensor(name);
+    PLX_ASSERT(t.dtype == PLX_F64 && t.ndim <= 2);
+    plx_mat m = plx_mat_from((int)t.dim[0], t.ndim == 2 ? (int)t.dim[1] : 1, t.data);
+    plx_tensor_free(&t);
+    return m;
+}
+
+/* top-k spectral projector V[:, 0:k] V[:, 0:k]^T: comparable across implementations (sign-free) */
+static plx_mat projector(const plx_mat *V, int k, int rows_are_vectors) {
+    int n = rows_are_vectors ? V->cols : V->rows;
+    plx_mat Vk = plx_mat_new(n, k), P = plx_mat_new(n, n);
+    for (int i = 0; i < n; i++)
+        for (int j = 0; j < k; j++) PLX_M(&Vk, i, j) = rows_are_vectors ? PLX_M(V, j, i) : PLX_M(V, i, j);
+    plx_syrk(PLX_NO_TRANS, 1.0, &Vk, 0.0, &P);
+    plx_mat_free(&Vk);
+    return P;
+}
+
+static double vec_rel_err(const double *x, const plx_mat *ref) {
+    double e = 0, nr = 0;
+    for (int i = 0; i < ref->rows * ref->cols; i++) {
+        e = PLX_MAX(e, fabs(x[i] - ref->a[i]));
+        nr = PLX_MAX(nr, fabs(ref->a[i]));
+    }
+    return e / nr;
+}
+
+TEST(numpy_oracle) {
+    g_oracle_dir = getenv("PLX_LA_ORACLE");
+    if (!g_oracle_dir) {
+        printf("  skipped: run tools/oracle/la_oracle.py DIR, then PLX_LA_ORACLE=DIR\n");
+        return;
+    }
+    plx_mat A = oracle_mat("gemm_a"), B = oracle_mat("gemm_b"), C = oracle_mat("gemm_c"), Cm = plx_matmul(&A, &B);
+    CHECK(rel_err(&Cm, &C) < 1e-15);
+
+    plx_mat S = oracle_mat("spd_a"), b = oracle_mat("spd_b"), x = oracle_mat("spd_x"), ld = oracle_mat("spd_logdet");
+    plx_mat L = plx_mat_clone(&S), xs = plx_mat_clone(&b);
+    CHECK(plx_chol(&L) == PLX_OK);
+    plx_chol_solve(&L, &xs);
+    CHECK(rel_err(&xs, &x) < 1e-13);
+    CHECK_NEAR(plx_chol_logdet(&L), ld.a[0], 1e-12 * fabs(ld.a[0]));
+
+    plx_mat G = oracle_mat("lu_a"), g = oracle_mat("lu_b"), gx = oracle_mat("lu_x"), gd = oracle_mat("lu_det");
+    plx_mat gs = plx_mat_clone(&g);
+    CHECK(plx_solve(&G, &gs) == PLX_OK && rel_err(&gs, &gx) < 1e-12);
+    CHECK(fabs(plx_det(&G) - gd.a[0]) < 1e-11 * fabs(gd.a[0]));
+
+    plx_mat La = oracle_mat("ls_a"), Lb = oracle_mat("ls_b"), Lx = oracle_mat("ls_x"), X = plx_mat_new(La.cols, Lb.cols);
+    CHECK(plx_lstsq(&La, &Lb, 0.0, 0.0, &X) == La.cols - 2);
+    CHECK(rel_err(&X, &Lx) < 1e-12); /* the minimum-norm solution, like the pseudo-inverse */
+
+    plx_mat E = oracle_mat("eig_a"), Ew = oracle_mat("eig_w"), Ep = oracle_mat("eig_p5"), EV = plx_mat_new(E.rows, E.rows);
+    double *w = PLX_NEW(double, E.rows);
+    CHECK(plx_eigh(&E, w, &EV) == PLX_OK);
+    plx_mat P5 = projector(&EV, 5, 0);
+    CHECK(vec_rel_err(w, &Ew) < 1e-14 && max_diff(&P5, &Ep) < 1e-12);
+
+    plx_mat Ga = oracle_mat("geig_a"), Gb = oracle_mat("geig_b"), Gw = oracle_mat("geig_w");
+    double *gw = PLX_NEW(double, Ga.rows);
+    CHECK(plx_eigh_gen(&Ga, &Gb, gw, NULL) == PLX_OK && vec_rel_err(gw, &Gw) < 1e-13);
+
+    plx_mat T = oracle_mat("svd_a"), Ts = oracle_mat("svd_s"), Wd = oracle_mat("svdw_a"), Ws = oracle_mat("svdw_s");
+    double s[64];
+    CHECK(plx_svd(&T, NULL, s, NULL) == PLX_OK && vec_rel_err(s, &Ts) < 1e-14);
+    CHECK(plx_svd(&Wd, NULL, s, NULL) == PLX_OK && vec_rel_err(s, &Ws) < 1e-14);
+
+    plx_tensor xt = oracle_tensor("pca_x");
+    plx_mat Ps = oracle_mat("pca_s"), Pp = oracle_mat("pca_p8");
+    PLX_ASSERT(xt.dtype == PLX_F32 && xt.ndim == 2);
+    static const plx_pca_method methods[] = {PLX_PCA_COV, PLX_PCA_GRAM, PLX_PCA_RANDOMIZED};
+    for (int m = 0; m < 3; m++) {
+        plx_pca p;
+        /* the data have rank 25 and a flat spectrum; with k + oversample >= 25 the randomised
+         * range finder captures the whole range and becomes exact */
+        plx_pca_opts o = {.method = methods[m], .oversample = 20};
+        CHECK(plx_pca_f32(xt.data, (int)xt.dim[0], (int)xt.dim[1], 8, &o, &p) == PLX_OK);
+        plx_mat P8 = projector(&p.axes, 8, 1);
+        CHECK(vec_rel_err(p.sv, &Ps) < 1e-12 && max_diff(&P8, &Pp) < 1e-10);
+        plx_mat_free(&P8);
+        plx_pca_free(&p);
+    }
+    printf("  numpy oracle: compared gemm, chol, lu, lstsq (pinv), eigh, eigh_gen, svd, pca\n");
+    free(w); free(gw);
+    plx_tensor_free(&xt);
+    plx_mat *all[] = {&A, &B, &C, &Cm, &S, &b, &x, &ld, &L, &xs, &G, &g, &gx, &gd, &gs, &La, &Lb, &Lx, &X, &E, &Ew, &Ep,
+                      &EV, &P5, &Ga, &Gb, &Gw, &T, &Ts, &Wd, &Ws, &Ps, &Pp};
+    for (size_t i = 0; i < sizeof all / sizeof all[0]; i++) plx_mat_free(all[i]);
+}
+
 /* ---- slow: scale and speed (PLX_SLOW_TESTS=1) ------------------------------------------------ */
 
 static void slow_tests(void) {
@@ -1303,7 +1409,7 @@ static void slow_tests(void) {
         }
         printf("  pca randomized 13000x20000 k=300: %.1f s; eigen-residual %.1e (top 10), %.1e (last 10); sv %.3g..%.3g\n",
                tp, r_first, r_last, p.sv[0], p.sv[k - 1]);
-        CHECK(r_first < 1e-5 && r_last < 1e-2);
+        CHECK(r_first < 1e-6 && r_last < 1e-3);
         free(Yf); free(Xt); free(XtY); free(colsum);
         plx_mat_free(&Yt);
         plx_pca_free(&p);
@@ -1327,6 +1433,7 @@ int main(void) {
     RUN(conjugate_gradient);
     RUN(data_statistics);
     RUN(pca_routes_agree);
+    RUN(numpy_oracle);
     const char *slow = getenv("PLX_SLOW_TESTS");
     if (slow && atoi(slow) > 0) RUN(slow_tests);
     return TEST_REPORT();

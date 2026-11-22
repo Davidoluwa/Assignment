@@ -12,8 +12,8 @@
  *     plx_status-style negative int; PLX_OK (0) on success.
  *   - Symmetric inputs: only the LOWER triangle (i >= j) is read; the upper triangle is ignored.
  *   - Eigen/singular values are sorted DESCENDING; vectors are COLUMNS of the output matrix, with a
- *     deterministic sign: the entry of largest magnitude in each eigenvector (each left singular
- *     vector for the SVD, each principal axis for PCA) is positive.
+ *     deterministic sign: the entry of largest magnitude in each eigenvector (each principal axis
+ *     for PCA; see plx_svd for its variant) is positive.
  *   - Heavy routines thread with plx_parallel_for; every result is bitwise independent of the
  *     thread count (each output element is reduced in a fixed order by exactly one task). */
 #ifndef PLX_LA_H
@@ -58,7 +58,8 @@ typedef enum { PLX_NO_TRANS = 0, PLX_TRANS = 1 } plx_op;
 void plx_gemm(plx_op ta, plx_op tb, double alpha, const plx_mat *A, const plx_mat *B, double beta, plx_mat *C);
 plx_mat plx_matmul(const plx_mat *A, const plx_mat *B); /* new A * B */
 
-/* y = alpha * op(A) * x + beta * y.  x has cols(op(A)) entries, y has rows(op(A)); beta == 0 ignores y. */
+/* y = alpha * op(A) * x + beta * y.  x has cols(op(A)) entries, y has rows(op(A)); beta == 0 ignores
+ * y. x and y must not overlap. */
 void plx_gemv(plx_op ta, double alpha, const plx_mat *A, const double *x, double beta, double *y);
 
 /* Symmetric rank-k update, both triangles of C written:
@@ -82,14 +83,15 @@ int    plx_spd_inverse(const plx_mat *A, plx_mat *Ainv); /* Ainv n x n, symmetri
  * plx_lu factors the n x n matrix in place (unit-lower L below the diagonal, U on and above) and
  * fills piv[n] (row k was swapped with row piv[k] at step k). It always completes; it returns
  * PLX_ESINGULAR if some |U_kk| <= n * eps * max|A| (singular to working precision: solves are then
- * meaningless), else PLX_OK. */
+ * meaningless), else PLX_OK. Blocked; the trailing update runs on the threaded gemm. */
 int    plx_lu(plx_mat *A, int *piv);
 void   plx_lu_solve(const plx_mat *LU, const int *piv, plx_mat *B);  /* B (n x nrhs) <- A^-1 B */
 void   plx_lu_solve_vec(const plx_mat *LU, const int *piv, double *b);
 double plx_lu_det(const plx_mat *LU, const int *piv);
 double plx_det(const plx_mat *A);                      /* via LU of a copy; exact 0 only if a pivot is 0 */
-int    plx_solve(const plx_mat *A, plx_mat *B);        /* B <- A^-1 B for square A; PLX_ESINGULAR */
-int    plx_inverse(const plx_mat *A, plx_mat *Ainv);   /* PLX_ESINGULAR (Ainv then unreliable) */
+/* Convenience wrappers on a copy of A; on PLX_ESINGULAR the output is left unchanged. */
+int    plx_solve(const plx_mat *A, plx_mat *B);        /* B (n x nrhs) <- A^-1 B */
+int    plx_inverse(const plx_mat *A, plx_mat *Ainv);   /* Ainv n x n */
 
 /* ---- QR and least squares ---------------------------------------------------------------
  * plx_qr: thin Householder QR of m x n A, k = min(m, n): Q is m x k with orthonormal columns
@@ -111,7 +113,10 @@ int plx_lstsq(const plx_mat *A, const plx_mat *B, double ridge, double rcond, pl
  * with eigenvectors as columns, or NULL for eigenvalues only (much cheaper). V may alias A.
  * Householder tridiagonalisation, then implicit-shift QL; the rotations are recorded and applied
  * to the eigenvector matrix in cache-sized column slices in parallel. Residual and orthogonality
- * are O(n eps ||A||). Returns PLX_ENOCONV if QL stalls (not seen in practice). */
+ * are O(n eps ||A||) (tests: <= 0.7 n eps); eigenvalue errors are O(eps ||A||) absolute, so tiny
+ * eigenvalues of an ill-conditioned matrix are not relatively accurate (use plx_svd on a factor
+ * if that matters). Repeated eigenvalues get an orthonormal basis of their eigenspace.
+ * Returns PLX_ENOCONV if QL exceeds 30 n sweeps (not seen in practice). */
 int plx_eigh(const plx_mat *A, double *w, plx_mat *V);
 
 /* Generalised A v = lambda B v, A symmetric, B SPD (lower triangles read): w[n] descending, V
@@ -126,8 +131,12 @@ int plx_eigh_gen(const plx_mat *A, const plx_mat *B, double *w, plx_mat *V);
  * preconditioning: few sweeps). Because every stage is column-wise backward stable, singular values
  * are computed to high RELATIVE accuracy (roughly eps * cond(A D^-1) for the best column scaling
  * D), not just eps * s_max: e.g. a 40 x 12 matrix B D with B well conditioned and column scales
- * down to 1e-12 gets all s_i to ~1e-14 relative error (see tests). Exactly-zero singular values get
- * an arbitrary orthonormal completion of V. Returns PLX_ENOCONV if Jacobi fails to converge. */
+ * down to 1e-11 gets all s_i to 5e-16 relative error (see tests). On unstructured matrices the
+ * small s_i still have absolute error O(eps s_max) like any method. Exactly-zero singular values
+ * get an arbitrary orthonormal completion. Sign convention (an exception to the general one): the
+ * largest-magnitude entry of each singular vector on the SMALLER side (V when m >= n, else U) is
+ * positive, so the result does not depend on which outputs are requested. Returns PLX_ENOCONV if
+ * Jacobi fails to converge in 60 sweeps, PLX_EINVAL for non-finite input. */
 int plx_svd(const plx_mat *A, plx_mat *U, double *s, plx_mat *V);
 
 /* ---- fixed small sizes (allocation-free; 3x3 arrays are row-major) --------------------------
@@ -146,7 +155,7 @@ void plx_nearest_rotation3(const double A[9], double R[9]);
  * entry (zeros are fine) and the solution on exit. diag (nullable) is the diagonal of A, used as
  * a Jacobi preconditioner (entries must be > 0). Stops when ||b - A x|| <= tol * ||b||, or after
  * max_iter iterations (max_iter <= 0 selects 2n). Returns PLX_OK, PLX_ENOCONV (iteration cap; x is
- * the best iterate), or PLX_ENOTSPD (p^T A p <= 0 encountered). info (nullable) receives the
+ * the last iterate), or PLX_ENOTSPD (p^T A p <= 0 encountered). info (nullable) receives the
  * iteration count and the final true relative residual. */
 typedef void (*plx_matvec_fn)(const double *x, double *y, void *ctx); /* y = A x */
 typedef struct { int iters; double rel_residual; } plx_cg_info;
@@ -174,7 +183,8 @@ void plx_cov_f32(const float *X, int n, int d, double *mean_out, plx_mat *C);
  *                       subspace iteration with Householder re-orthonormalisation after every
  *                       product, then an exact SVD of the small projected matrix (Halko et al.).
  *                       Accurate when the spectrum decays; error ~ (sv_{k+p} / sv_i)^(2q+1).
- * Defaults (field 0): oversample = max(10, k / 10), power_iters = 4, seed = 0x5eed.
+ * Defaults (field 0): oversample = max(10, k / 2), power_iters = 3, seed = 0x5eed (large
+ * oversampling is the cheap way to get the trailing components right on slow spectra).
  * out->axes is k x d with ROWS the principal axes (orthonormal); sv[k] are singular values of Xc
  * (variance of component i = sv_i^2 / (n - 1)); out->mean is the column mean.
  * Returns PLX_OK or PLX_ENOCONV (from the inner eigen/SVD solvers). */

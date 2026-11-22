@@ -41,60 +41,80 @@ static void dot3(const double *x, const double *y, int n, double *xx, double *yy
 
 typedef struct {
     double *G, *J;
-    int n;
+    int n, nblk;
     double tol;
-    const int *pairs; /* 2 entries per pair; an index >= n is the bye of an odd-sized tournament */
+    const int *pairs; /* block pairs of the current round */
     unsigned char *hit;
 } jac_job;
 
-static void jacobi_pair(int64_t q, int tid, void *ctx) {
-    jac_job *jb = ctx;
-    const int p = jb->pairs[2 * q], r = jb->pairs[2 * q + 1], n = jb->n;
-    jb->hit[q] = 0;
-    if (p >= n || r >= n) return;
+/* Orthogonalises rows p and r of G (and rotates J alongside); returns 1 if a rotation was done. */
+static int jacobi_rotate(const jac_job *jb, int p, int r) {
+    const int n = jb->n;
     double *gp = jb->G + (size_t)p * n, *gr = jb->G + (size_t)r * n;
     double alpha, beta, gamma;
     dot3(gp, gr, n, &alpha, &beta, &gamma);
-    if (!(fabs(gamma) > jb->tol * sqrt(alpha) * sqrt(beta))) return;
+    if (!(fabs(gamma) > jb->tol * sqrt(alpha) * sqrt(beta))) return 0;
     /* Rutishauser's rotation: the smaller root of t^2 + 2 zeta t - 1 = 0 (|angle| <= pi/4) */
     double zeta = (beta - alpha) / (2.0 * gamma);
     double t = copysign(1.0, zeta) / (fabs(zeta) + hypot(1.0, zeta));
     double c = 1.0 / hypot(1.0, t), s = c * t;
     la_rot(gp, gr, (size_t)n, c, s);
     if (jb->J) la_rot(jb->J + (size_t)p * n, jb->J + (size_t)r * n, (size_t)n, c, s);
-    jb->hit[q] = 1;
+    return 1;
 }
 
-/* Parallel cyclic Jacobi in round-robin (tournament) order: each round is n/2 disjoint pairs that
- * can be rotated concurrently, and n-1 rounds visit every pair once (one sweep). */
+static int blk_lo(const jac_job *jb, int b) { return (int)((int64_t)b * jb->n / jb->nblk); }
+
+static void jacobi_within(int64_t b, int tid, void *ctx) {
+    const jac_job *jb = ctx;
+    const int lo = blk_lo(jb, (int)b), hi = blk_lo(jb, (int)b + 1);
+    int hit = 0;
+    for (int p = lo; p < hi; p++)
+        for (int r = p + 1; r < hi; r++) hit |= jacobi_rotate(jb, p, r);
+    jb->hit[b] = (unsigned char)hit;
+}
+
+static void jacobi_cross(int64_t q, int tid, void *ctx) {
+    const jac_job *jb = ctx;
+    const int a = jb->pairs[2 * q], b = jb->pairs[2 * q + 1];
+    int hit = 0;
+    for (int p = blk_lo(jb, a); p < blk_lo(jb, a + 1); p++)
+        for (int r = blk_lo(jb, b); r < blk_lo(jb, b + 1); r++) hit |= jacobi_rotate(jb, p, r);
+    jb->hit[q] = (unsigned char)hit;
+}
+
+/* Block-cyclic parallel Jacobi. The rows are split into 2P blocks (P from n alone, so the result
+ * does not depend on the thread count). A sweep first does every pair inside each block, then
+ * 2P-1 tournament rounds in which P disjoint block pairs do all their cross pairs concurrently:
+ * every row pair is visited once per sweep, a block pair (~2n/2P rows of G and J) stays in L2,
+ * and there are ~2P parallel calls per sweep instead of the n-1 of a row-level tournament. */
 static int jacobi_rows(double *G, int n, double *J) {
-    const int n2 = n + (n & 1), np = n2 / 2;
-    int *players = plx_malloc(sizeof(int) * n2), *pairs = plx_malloc(sizeof(int) * n2);
-    unsigned char *hit = plx_malloc((size_t)np);
-    for (int i = 0; i < n2; i++) players[i] = i;
+    const int P = PLX_CLAMP(n / 48, 1, 16), nblk = 2 * P;
+    int *players = plx_malloc(sizeof(int) * nblk), *pairs = plx_malloc(sizeof(int) * nblk);
+    unsigned char *hit = plx_malloc((size_t)nblk);
     /* convergence when every pair has |g_p . g_q| <= tol |g_p| |g_q|; sqrt(n) eps is the size of
      * the rounding noise in a length-n dot product, so a tighter tolerance would chase noise. */
-    jac_job jb = {G, J, n, sqrt((double)n) * DBL_EPSILON, pairs, hit};
-    int rc = PLX_ENOCONV;
-    for (int sweep = 0; sweep < MAX_SWEEPS && n > 1; sweep++) {
+    jac_job jb = {G, J, n, nblk, sqrt((double)n) * DBL_EPSILON, pairs, hit};
+    const double bs = (double)n / nblk, pair_flops = (J ? 18.0 : 12.0) * n;
+    int rc = n <= 1 ? PLX_OK : PLX_ENOCONV;
+    for (int sweep = 0; sweep < MAX_SWEEPS && rc != PLX_OK; sweep++) {
         int rotated = 0;
-        for (int round = 0; round < n2 - 1; round++) {
-            for (int i = 0; i < np; i++) {
+        la_par_for(nblk, 0.5 * bs * bs * pair_flops, jacobi_within, &jb);
+        for (int i = 0; i < nblk; i++) rotated |= hit[i];
+        for (int i = 0; i < nblk; i++) players[i] = i;
+        for (int round = 0; round < nblk - 1; round++) {
+            for (int i = 0; i < P; i++) {
                 pairs[2 * i] = players[i];
-                pairs[2 * i + 1] = players[n2 - 1 - i];
+                pairs[2 * i + 1] = players[nblk - 1 - i];
             }
-            la_par_for(np, (J ? 12.0 : 6.0) * n + 6.0 * n, jacobi_pair, &jb);
-            for (int i = 0; i < np; i++) rotated |= hit[i];
-            int last = players[n2 - 1]; /* keep players[0] fixed, rotate the rest by one */
-            memmove(players + 2, players + 1, sizeof(int) * (n2 - 2));
+            la_par_for(P, bs * bs * pair_flops, jacobi_cross, &jb);
+            for (int i = 0; i < P; i++) rotated |= hit[i];
+            int last = players[nblk - 1]; /* keep players[0] fixed, rotate the rest by one */
+            memmove(players + 2, players + 1, sizeof(int) * (nblk - 2));
             players[1] = last;
         }
-        if (!rotated) {
-            rc = PLX_OK;
-            break;
-        }
+        if (!rotated) rc = PLX_OK;
     }
-    if (n <= 1) rc = PLX_OK;
     free(players);
     free(pairs);
     free(hit);

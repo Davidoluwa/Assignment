@@ -1,10 +1,10 @@
 /* Matrix products. One packed, cache-blocked kernel (Goto/BLIS structure) serves gemm, syrk, the
  * blocked factorisations and the float32 data-matrix products:
  *
- *   for each K block of KC:                       (serial: C accumulates across K blocks)
- *     pack op(B)[K block, all columns] into NR-wide panels          (shared, ~KC x n)
- *     parallel over C tiles of MC x NB:
- *       pack op(A)[tile rows, K block] into MR-high panels          (per thread, sits in L2)
+ *   pack op(B) into NR-wide panels per K block of KC          (shared; all of K when it fits)
+ *   parallel over C tiles of MC x NB (smaller when that leaves threads idle):
+ *     for each K block, in order:                            (C accumulates across K blocks)
+ *       pack op(A)[tile rows, K block] into MR-high panels  (per thread, sits in L2)
  *       for each NR panel of the tile: for each MR panel: 8x8 register micro-kernel
  *
  * The micro-kernel keeps its 8x8 accumulator in 16 AVX registers: GCC vectorises the j loop and
@@ -91,7 +91,9 @@ static void scale_block(double *C, int64_t ldc, int m, int n, double beta) {
 }
 
 typedef struct {
-    int m, n, pc, kc, ntn, lower;
+    int m, n, k, ntn, lower, mc, nb, npb;
+    int pc0, nkb; /* K blocks [pc0, pc0 + nkb * KC) are packed in bpack */
+    int kstride;  /* min(KC, k): packed panel stride per K block */
     double alpha, beta;
     const la_opnd *A;
     la_opnd Bt; /* op(B)^T, so B packs with the same routine as A */
@@ -102,29 +104,43 @@ typedef struct {
     const int *tiles;
 } gemm_job;
 
-static void pack_b_task(int64_t q, int tid, void *ctx) {
+static int kblock_len(const gemm_job *g, int b) { return PLX_MIN(KC, g->k - (g->pc0 + b * KC)); }
+
+/* Packed B: K block b, NR panel q at bpack + (b * npb + q) * kstride * NR. */
+static void pack_b_task(int64_t t, int tid, void *ctx) {
     gemm_job *g = ctx;
-    int j0 = (int)q * NR;
-    pack(&g->Bt, j0, PLX_MIN(NR, g->n - j0), g->pc, g->kc, NR, g->bpack + (size_t)q * g->kc * NR);
+    const int b = (int)(t / g->npb), q = (int)(t % g->npb), j0 = q * NR;
+    pack(&g->Bt, j0, PLX_MIN(NR, g->n - j0), g->pc0 + b * KC, kblock_len(g, b), NR,
+         g->bpack + ((size_t)b * g->npb + q) * g->kstride * NR);
 }
 
 static void tile_task(int64_t t, int tid, void *ctx) {
     gemm_job *g = ctx;
-    int i0 = (g->tiles[t] / g->ntn) * MC, j0 = (g->tiles[t] % g->ntn) * NB;
-    int mc = PLX_MIN(MC, g->m - i0), nb = PLX_MIN(NB, g->n - j0);
+    int i0 = (g->tiles[t] / g->ntn) * g->mc, j0 = (g->tiles[t] % g->ntn) * g->nb;
+    int mc = PLX_MIN(g->mc, g->m - i0), nb = PLX_MIN(g->nb, g->n - j0);
     double *C = g->C + i0 * g->ldc + j0;
-    if (g->pc == 0) scale_block(C, g->ldc, mc, nb, g->beta);
+    if (g->pc0 == 0) scale_block(C, g->ldc, mc, nb, g->beta);
     double *ap = g->apack + (size_t)tid * g->apack_stride;
-    pack(g->A, i0, mc, g->pc, g->kc, MR, ap);
-    for (int jr = 0; jr < nb; jr += NR) {
-        const double *bp = g->bpack + (size_t)((j0 + jr) / NR) * g->kc * NR;
-        for (int ir = 0; ir < mc; ir += MR) {
-            if (g->lower && j0 + jr > i0 + ir + MR - 1) continue; /* micro-tile entirely above diagonal */
-            micro_kernel(g->kc, ap + (size_t)ir * g->kc, bp, g->alpha, C + ir * g->ldc + jr, g->ldc,
-                         PLX_MIN(MR, mc - ir), PLX_MIN(NR, nb - jr));
+    for (int b = 0; b < g->nkb; b++) { /* K blocks in order: the same sum order for every tiling */
+        const int kc = kblock_len(g, b);
+        pack(g->A, i0, mc, g->pc0 + b * KC, kc, MR, ap);
+        for (int jr = 0; jr < nb; jr += NR) {
+            const double *bp = g->bpack + ((size_t)b * g->npb + (j0 + jr) / NR) * g->kstride * NR;
+            for (int ir = 0; ir < mc; ir += MR) {
+                if (g->lower && j0 + jr > i0 + ir + MR - 1) continue; /* micro-tile entirely above diagonal */
+                micro_kernel(kc, ap + (size_t)ir * kc, bp, g->alpha, C + ir * g->ldc + jr, g->ldc,
+                             PLX_MIN(MR, mc - ir), PLX_MIN(NR, nb - jr));
+            }
         }
     }
 }
+
+/* Bytes of packed B held at once. Packing all of K up front lets one parallel region per gemm do
+ * all the work (each tile walks the K blocks itself); regions are costly because plx_parallel_for
+ * starts threads per call, so a K-blocked outer loop with two regions per 256 of K made thin
+ * products (k in the thousands, small m n) slower on 4 threads than on 1. The cap bounds memory
+ * for huge float products, which then use a few groups of K blocks. */
+#define BPACK_BYTES (64.0 * 1024 * 1024)
 
 void la_gemm(int m, int n, int k, double alpha, const la_opnd *A, const la_opnd *B, double beta,
              double *C, int64_t ldc, int lower_only) {
@@ -144,24 +160,35 @@ void la_gemm(int m, int n, int k, double alpha, const la_opnd *A, const la_opnd 
         return;
     }
 
-    int ntm = (m + MC - 1) / MC, ntn = (n + NB - 1) / NB, nt = 0;
+    /* Shrink the tiles until there are a few per thread: thin results such as the 32 x n
+     * V^T C of blocked Householder would otherwise be one or two tiles, i.e. one or two busy
+     * threads. Tiling only decides who computes an element, never the order of its sum, so the
+     * result is the same for every tile size. */
+    const int nthreads = plx_num_threads(), want = 4 * nthreads;
+    int mc = MC, nb = NB;
+    while (((m + mc - 1) / mc) * ((n + nb - 1) / nb) < want && nb > NR) nb /= 2;
+    while (((m + mc - 1) / mc) * ((n + nb - 1) / nb) < want && mc > MR) mc /= 2;
+    int ntm = (m + mc - 1) / mc, ntn = (n + nb - 1) / nb, nt = 0;
     int *tiles = PLX_NEW(int, (size_t)ntm * ntn);
     for (int ti = 0; ti < ntm; ti++)
         for (int tj = 0; tj < ntn; tj++)
-            if (!lower_only || tj * NB <= ti * MC + MC - 1) tiles[nt++] = ti * ntn + tj;
+            if (!lower_only || tj * nb <= ti * mc + mc - 1) tiles[nt++] = ti * ntn + tj;
 
-    int npb = (n + NR - 1) / NR, kcmax = PLX_MIN(KC, k);
-    int mcmax = PLX_MIN(MC, (m + MR - 1) / MR * MR), nthreads = plx_num_threads();
-    gemm_job g = {.m = m, .n = n, .ntn = ntn, .lower = lower_only, .alpha = alpha, .beta = beta, .A = A,
-                  .C = C, .ldc = ldc, .tiles = tiles, .apack_stride = (size_t)mcmax * kcmax};
+    const int npb = (n + NR - 1) / NR, nkb_total = (k + KC - 1) / KC;
+    const int group = (int)PLX_CLAMP(BPACK_BYTES / (sizeof(double) * (double)npb * NR * KC), 1, nkb_total);
+    const int mcmax = PLX_MIN(mc, (m + MR - 1) / MR * MR);
+    gemm_job g = {.m = m, .n = n, .k = k, .ntn = ntn, .lower = lower_only, .mc = mc, .nb = nb, .npb = npb,
+                  .kstride = PLX_MIN(KC, k), .alpha = alpha, .beta = beta, .A = A, .C = C, .ldc = ldc,
+                  .tiles = tiles, .apack_stride = (size_t)mcmax * PLX_MIN(KC, k)};
     g.Bt = (la_opnd){.d = B->d, .f = B->f, .rs = B->cs, .cs = B->rs, .sub_row = B->sub_col, .sub_col = B->sub_row};
-    g.bpack = plx_malloc(sizeof(double) * (size_t)npb * NR * kcmax);
+    g.bpack = plx_malloc(sizeof(double) * (size_t)group * npb * NR * g.kstride);
     g.apack = plx_malloc(sizeof(double) * g.apack_stride * nthreads);
-    for (int pc = 0; pc < k; pc += KC) {
-        g.pc = pc;
-        g.kc = PLX_MIN(KC, k - pc);
-        la_par_for(npb, 4.0 * NR * g.kc, pack_b_task, &g);
-        la_par_for(nt, 2.0 * MC * NB * g.kc, tile_task, &g);
+    for (int kb0 = 0; kb0 < nkb_total; kb0 += group) {
+        g.pc0 = kb0 * KC;
+        g.nkb = PLX_MIN(group, nkb_total - kb0);
+        const int kg = PLX_MIN(g.nkb * KC, k - g.pc0);
+        la_par_for((int64_t)g.nkb * npb, 4.0 * NR * KC, pack_b_task, &g);
+        la_par_for(nt, 2.0 * mc * nb * kg, tile_task, &g);
     }
     free(g.apack);
     free(g.bpack);
@@ -237,6 +264,7 @@ static void gemv_t_task(int64_t b, int tid, void *ctx) {
 }
 
 void plx_gemv(plx_op ta, double alpha, const plx_mat *A, const double *x, double beta, double *y) {
+    PLX_ASSERT(x != y);
     gemv_job g = {A, x, y, alpha, beta};
     if (ta == PLX_TRANS)
         la_par_for((A->cols + GEMV_COLS - 1) / GEMV_COLS, 2.0 * A->rows * GEMV_COLS, gemv_t_task, &g);

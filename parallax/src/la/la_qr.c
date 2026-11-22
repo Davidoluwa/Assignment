@@ -42,17 +42,17 @@ static void block_v(const la_qr *q, int j0, int jb, double *V) {
 }
 
 /* Compact WY: H_0 ... H_{jb-1} = I - V T V^T with T upper triangular, built column by column from
- * T[0:j, j] = -tau_j T[0:j, 0:j] (V[:, 0:j]^T v_j). T is NB x NB (leading dim NB). */
-static void block_t(const double *V, int mm, int jb, const double *tau, double *T) {
+ * T[0:j, j] = -tau_j T[0:j, 0:j] (V[:, 0:j]^T v_j). */
+void la_wy_t(const double *V, int mm, int jb, const double *tau, double *T, int ldt) {
     double *G = plx_malloc(sizeof(double) * jb * jb);
     la_dgemm(1, 0, jb, jb, mm, 1.0, V, jb, V, jb, 0.0, G, jb);
-    memset(T, 0, sizeof(double) * NB * NB);
+    for (int i = 0; i < jb; i++) memset(T + i * ldt, 0, sizeof(double) * jb);
     for (int j = 0; j < jb; j++) {
-        T[j * NB + j] = tau[j];
+        T[j * ldt + j] = tau[j];
         for (int i = 0; i < j; i++) {
             double s = 0;
-            for (int p = i; p < j; p++) s += T[i * NB + p] * G[p * jb + j];
-            T[i * NB + j] = -tau[j] * s;
+            for (int p = i; p < j; p++) s += T[i * ldt + p] * G[p * jb + j];
+            T[i * ldt + j] = -tau[j] * s;
         }
     }
     free(G);
@@ -96,7 +96,7 @@ void la_qr_factor(la_qr *q, double *a, int m, int n, int64_t lda) {
         }
         double *T = q->t + (size_t)(j0 / NB) * NB * NB;
         block_v(q, j0, jb, V);
-        block_t(V, mm, jb, q->tau + j0, T);
+        la_wy_t(V, mm, jb, q->tau + j0, T, NB);
         if (n > j0 + jb) block_apply(V, mm, jb, T, 1, a + j0 * lda + j0 + jb, n - j0 - jb, lda, W, W2);
     }
     free(V);
@@ -166,7 +166,7 @@ void la_qrcp_factor(la_qr *q, double *a, int m, int n, int64_t lda, int *perm) {
     for (int j0 = 0; j0 < q->k; j0 += NB) {
         int jb = PLX_MIN(NB, q->k - j0);
         block_v(q, j0, jb, V);
-        block_t(V, m - j0, jb, q->tau + j0, q->t + (size_t)(j0 / NB) * NB * NB);
+        la_wy_t(V, m - j0, jb, q->tau + j0, q->t + (size_t)(j0 / NB) * NB * NB, NB);
     }
     free(V);
     free(vn1);

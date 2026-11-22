@@ -7,9 +7,10 @@
 #include <float.h>
 #include <math.h>
 
-/* Below this many flops a loop is run on the calling thread: plx_parallel_for spawns threads per
- * call (~10-30 us), so tiny jobs would be dominated by thread start-up. */
-#define LA_PAR_MIN_FLOPS 2.0e5
+/* Below this many flops a loop is run on the calling thread. plx_parallel_for spawns and joins
+ * threads on every call (tens of microseconds, much more when the machine is oversubscribed and a
+ * worker is descheduled), so a region needs ~50 us of work (1e6 flops) to pay for itself. */
+#define LA_PAR_MIN_FLOPS 1.0e6
 
 /* Runs fn over [0, n) in parallel if the total work justifies it, else serially. */
 void la_par_for(int64_t n, double flops_per_item, plx_par_fn fn, void *ctx);
@@ -81,6 +82,9 @@ void la_qr_apply(const la_qr *q, int trans, double *C, int nc, int64_t ldc);
 /* Q[:, 0:k] explicitly, into an m x k array. */
 void la_qr_form_q(const la_qr *q, double *Q, int64_t ldq);
 void la_qr_free(la_qr *q);
+/* T (jb x jb upper, leading dim ldt) with H_0 ... H_{jb-1} = I - V T V^T, for the explicit
+ * reflector matrix V (mm x jb, contiguous, unit diagonal, zeros above). */
+void la_wy_t(const double *V, int mm, int jb, const double *tau, double *T, int ldt);
 
 /* ---- decompositions on raw buffers ------------------------------------------------------ */
 /* Thin SVD of the m x n row-major array a (destroyed), k = min(m, n); U (m x k) and V (n x k)

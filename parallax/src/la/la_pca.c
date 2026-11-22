@@ -166,10 +166,10 @@ static int pca_randomized(const float *X, int n, int d, int l, int q, uint64_t s
     return rc;
 }
 
-/* Rough cost model, in gemm-flop equivalents. EIG_COST: flops-equivalent per n^3 of a full
- * plx_eigh with vectors relative to the threaded gemm (measured: level-2 tridiagonalisation and
- * rotation replay run ~20x below gemm speed). QR_COST likewise for Householder QR + forming Q. */
-#define EIG_COST 60.0
+/* Rough cost model, in gemm-flop equivalents. EIG_COST: plx_eigh with vectors at n = 2000 takes
+ * as long as ~3.5e11 flops of threaded gemm, i.e. ~45 n^3 (it is level-2 and rotation bound).
+ * QR_COST: Householder QR plus forming Q of a tall r x l matrix, per r l^2 (panel-bound). */
+#define EIG_COST 45.0
 #define QR_COST 6.0
 #define EXACT_PREFERENCE 2.0 /* randomised must be this much cheaper to be chosen: it is approximate */
 
@@ -190,8 +190,12 @@ static plx_pca_method pick_method(double n, double d, double k, double l, double
 int plx_pca_f32(const float *X, int n, int d, int k, const plx_pca_opts *opts, plx_pca *out) {
     PLX_ASSERT(n >= 2 && d >= 1 && k >= 1 && k <= PLX_MIN(n, d));
     plx_pca_opts o = opts ? *opts : (plx_pca_opts){0};
-    if (o.oversample <= 0) o.oversample = PLX_MAX(10, k / 10);
-    if (o.power_iters <= 0) o.power_iters = 4;
+    /* Generous oversampling beats extra power iterations for slowly decaying spectra: the error
+     * factor is (s_{k+p} / s_k)^(2q+1), and raising p shrinks the base while costing only linearly.
+     * Measured on 13000 x 20000, k = 300, s_i ~ 0.99^i: p = 30, q = 4 left 2e-2 eigen-residual on
+     * the last components; p = 150, q = 3 gives 8e-6 for 10% more time. */
+    if (o.oversample <= 0) o.oversample = PLX_MAX(10, k / 2);
+    if (o.power_iters <= 0) o.power_iters = 3;
     if (o.seed == 0) o.seed = 0x5eed;
     const int l = PLX_MIN(k + o.oversample, PLX_MIN(n, d));
     if (o.method == PLX_PCA_AUTO) o.method = pick_method(n, d, k, l, o.power_iters);
