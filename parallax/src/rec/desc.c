@@ -72,7 +72,7 @@ plx_desc_layout plx_desc_layout_of(const plx_desc_params *p) {
     PLX_ASSERT(p->n_blocks >= 1 && p->n_blocks <= PLX_DESC_MAX_BLOCKS);
     /* even region bounds keep every level-1 cell boundary on a level-0 pixel boundary */
     PLX_ASSERT(p->x0 >= 0 && p->y0 >= 0 && p->w > 0 && p->h > 0 && p->x0 % 2 == 0 && p->y0 % 2 == 0 &&
-               p->w % 2 == 0 && p->h % 2 == 0 && p->x0 + p->w <= PLX_CANON_W && p->y0 + p->h <= PLX_CANON_H);
+               p->w % 2 == 0 && p->h % 2 == 0 && p->x0 + p->w <= PLX_REC_TEX_W && p->y0 + p->h <= PLX_REC_TEX_H);
     plx_desc_layout L = {.n_blocks = p->n_blocks};
     for (int i = 0; i < p->n_blocks; i++) {
         const plx_block_spec *b = &p->block[i];
@@ -124,14 +124,14 @@ static const plx_img *level_norm(level_imgs *lv, const plx_desc_params *p, int l
 
 void plx_desc_compute(const plx_desc_params *p, const plx_img *tex, const plx_img *conf, float *desc,
                       float *cell_w) {
-    PLX_ASSERT(tex->w == PLX_CANON_W && tex->h == PLX_CANON_H && tex->c == 1);
+    PLX_ASSERT(tex->w == PLX_REC_TEX_W && tex->h == PLX_REC_TEX_H && tex->c == 1);
     PLX_ASSERT(!conf || (conf->w == tex->w && conf->h == tex->h && conf->c == 1));
     plx_desc_layout L = plx_desc_layout_of(p);
     uint8_t uniform[256];
     plx_lbp_uniform_table(uniform);
     level_imgs lv[2];
     memset(lv, 0, sizeof lv);
-    uint8_t *codes = plx_malloc((size_t)PLX_CANON_W * PLX_CANON_H);
+    uint8_t *codes = plx_malloc((size_t)PLX_REC_TEX_W * PLX_REC_TEX_H);
     float *cw = PLX_NEW(float, L.n_cells);
 
     for (int i = 0; i < p->n_blocks; i++) {

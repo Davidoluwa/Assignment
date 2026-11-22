@@ -2,7 +2,7 @@
  * descriptor with per-cell confidence.
  *
  * The seam that matters: everything after "where the texture comes from" takes a canonical
- * texture (PLX_CANON_W x PLX_CANON_H, 1 channel, intensities ~[0, 1]) plus a confidence plane of
+ * texture (PLX_REC_TEX_W x PLX_REC_TEX_H, 1 channel, intensities ~[0, 1]) plus a confidence plane of
  * the same size (1 = fully trusted, 0 = no evidence). Today the texture comes from a similarity
  * (plx_rec_texture_sim) and the confidence is the warp's in-image mask; later rungs hand in a
  * densely warped texture and a visibility map through exactly the same plx_desc_compute call.
@@ -17,10 +17,10 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#define PLX_CANON_W 128
-#define PLX_CANON_H 160
-#define PLX_CANON_CX 63.5f
-#define PLX_CANON_CY 79.5f
+#define PLX_REC_TEX_W 128
+#define PLX_REC_TEX_H 160
+#define PLX_REC_C0X 63.5f
+#define PLX_REC_C0Y 79.5f
 
 /* ---- texture ------------------------------------------------------------------------- */
 /* 2x3 affine (plx_warp_affine form) of the similarity sim = (a, b, tx, ty):
@@ -28,7 +28,7 @@
 void plx_rec_sim_affine(const float sim[4], float A[6]);
 
 /* Canonical texture of a 250x250 gray image under sim. tex and conf must be preallocated
- * PLX_CANON_W x PLX_CANON_H x 1. Bicubic resampling; when the similarity shrinks the image
+ * PLX_REC_TEX_W x PLX_REC_TEX_H x 1. Bicubic resampling; when the similarity shrinks the image
  * (scale |(a, b)| > 1) the source is pre-blurred so the texture is not aliased. conf gets the
  * in-image mask (1 where the source point lies inside the photo, else 0). */
 void plx_rec_texture_sim(const plx_img *gray, const float sim[4], plx_img *tex, plx_img *conf);
@@ -100,7 +100,7 @@ typedef struct {
 } plx_desc_layout;
 plx_desc_layout plx_desc_layout_of(const plx_desc_params *p);
 
-/* Descriptor of one canonical texture. tex: PLX_CANON_W x PLX_CANON_H x 1 (not modified).
+/* Descriptor of one canonical texture. tex: PLX_REC_TEX_W x PLX_REC_TEX_H x 1 (not modified).
  * conf: same shape, values in [0, 1], or NULL for uniform confidence. desc gets layout.d floats,
  * cell_w (nullable) layout.n_cells floats. Thread-safe; allocates its own scratch. */
 void plx_desc_compute(const plx_desc_params *p, const plx_img *tex, const plx_img *conf, float *desc,

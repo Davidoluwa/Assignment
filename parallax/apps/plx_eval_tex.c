@@ -165,7 +165,7 @@ typedef struct {
 
 static void desc_one(int64_t i, int tid, void *ctx) {
     desc_job *j = ctx;
-    plx_img tex = plx_img_new(PLX_CANON_W, PLX_CANON_H, 1), conf = plx_img_new(PLX_CANON_W, PLX_CANON_H, 1);
+    plx_img tex = plx_img_new(PLX_REC_TEX_W, PLX_REC_TEX_H, 1), conf = plx_img_new(PLX_REC_TEX_W, PLX_REC_TEX_H, 1);
     texture_of(j->ds, (int)i, &tex, &conf);
     plx_desc_compute(j->p, &tex, &conf, j->x + (size_t)i * j->lay.d, j->cw + (size_t)i * j->lay.n_cells);
     plx_img_free(&tex);
@@ -266,7 +266,7 @@ static void texture_montage(const dataset *ds, const plx_desc_params *p, const c
         /* spread over the dev-test pairs: a mix of people, lighting and pose */
         const plx_pair *pr = &ds->dev_test.p[(size_t)t * ds->dev_test.n / NIMG];
         int img = t % 2 ? pr->b : pr->a;
-        plx_img tex = plx_img_new(PLX_CANON_W, PLX_CANON_H, 1), conf = plx_img_new(PLX_CANON_W, PLX_CANON_H, 1);
+        plx_img tex = plx_img_new(PLX_REC_TEX_W, PLX_REC_TEX_H, 1), conf = plx_img_new(PLX_REC_TEX_W, PLX_REC_TEX_H, 1);
         texture_of(ds, img, &tex, &conf);
         plx_img norm = plx_img_clone(&tex);
         plx_photo_normalize(&norm, &conf, &p->photo);
@@ -291,15 +291,15 @@ static void texture_montage(const dataset *ds, const plx_desc_params *p, const c
 
 /* the two canonical textures side by side, with the descriptor region outlined */
 static plx_img pair_tile(const dataset *ds, const plx_desc_params *p, int a, int b) {
-    plx_img tile = plx_img_new(2 * PLX_CANON_W + 4, PLX_CANON_H, 3);
-    plx_img tex = plx_img_new(PLX_CANON_W, PLX_CANON_H, 1), conf = plx_img_new(PLX_CANON_W, PLX_CANON_H, 1);
+    plx_img tile = plx_img_new(2 * PLX_REC_TEX_W + 4, PLX_REC_TEX_H, 3);
+    plx_img tex = plx_img_new(PLX_REC_TEX_W, PLX_REC_TEX_H, 1), conf = plx_img_new(PLX_REC_TEX_W, PLX_REC_TEX_H, 1);
     const float red[3] = {0.9f, 0.3f, 0.2f};
     for (int s = 0; s < 2; s++) {
         texture_of(ds, s ? b : a, &tex, &conf);
-        int ox = s * (PLX_CANON_W + 4);
+        int ox = s * (PLX_REC_TEX_W + 4);
         for (int k = 0; k < 3; k++)
-            for (int y = 0; y < PLX_CANON_H; y++)
-                for (int x = 0; x < PLX_CANON_W; x++) PLX_PX(&tile, ox + x, y, k) = PLX_PX(&tex, x, y, 0);
+            for (int y = 0; y < PLX_REC_TEX_H; y++)
+                for (int x = 0; x < PLX_REC_TEX_W; x++) PLX_PX(&tile, ox + x, y, k) = PLX_PX(&tex, x, y, 0);
         plx_draw_rect_outline(&tile, ox + p->x0 - 0.5f, p->y0 - 0.5f, ox + p->x0 + p->w - 0.5f, p->y0 + p->h - 0.5f,
                               1.0f, red, 0.6f);
     }
@@ -423,6 +423,81 @@ static void run_view(const evaluator *ev, const plx_match_cfg *cfg, bool view2) 
     free(score[1]);
 }
 
+/* ---- ablation ----------------------------------------------------------------------------
+ * View 1 only (View 2 is never touched here). Each row is a set of flags applied to the built-in
+ * defaults, exactly as on the command line; rows are cumulative where the label says "+". */
+static const char *const ABLATION[][2] = {
+    {"LBP(8,1) raw histograms, chi-square", "--blocks lbp1:8 --nophoto --nosqrt --score chi2"},
+    {"+ photometric normalisation", "--blocks lbp1:8 --nosqrt --score chi2"},
+    {"+ Hellinger (sqrt), raw cosine", "--blocks lbp1:8 --score cos"},
+    {"+ PCA-whitening, cosine", "--blocks lbp1:8"},
+    {"  same, PCA without whitening", "--blocks lbp1:8 --nowhiten"},
+    {"  same, no photometric normalisation", "--blocks lbp1:8 --nophoto"},
+    {"  same, no sqrt", "--blocks lbp1:8 --nosqrt"},
+    {"LBP(8,2) alone", "--blocks lbp2:8"},
+    {"LBP(8,2) at half resolution alone", "--blocks lbp2@1:8"},
+    {"orientation histograms alone", "--blocks ori:8"},
+    {"LBP(8,1) + LBP(8,2)", "--blocks lbp1:8,lbp2:8"},
+    {"default blocks (all of the above)", ""},
+    {"  same, one global PCA instead of per block", "--global-pca"},
+    {"  same, no photometric normalisation", "--nophoto"},
+    {"  PCA dims / 2", "--pca 200"},
+    {"  PCA dims x 2", "--pca 800"},
+    {"default + pair-LDA (restricted)", "--sup lda"},
+    {"default + joint Bayes (restricted)", "--sup jb"},
+    {"default + logistic pair model (restricted)", "--sup logit"},
+};
+
+static void ablation(const dataset *ds, const char *out) {
+    char path[4096];
+    snprintf(path, sizeof path, "%s/ablation.txt", out);
+    FILE *f = fopen(path, "w");
+    if (!f) plx_die("cannot write %s", path);
+    fprintf(f, "# View 1 ingredient table (train pairsDevTrain, test pairsDevTest), texture: %s\n",
+            ds->sim_path ? ds->sim_path : "identity (L0)");
+    fprintf(f, "# %-44s %-17s %-17s  flags\n", "configuration", "unsup acc / AUC", "restr. acc / AUC");
+    float *x = NULL, *cw = NULL;
+    char have[1200] = "";
+    for (size_t r = 0; r < sizeof ABLATION / sizeof ABLATION[0]; r++) {
+        char buf[512], *argv[32] = {"ablation"};
+        int argc = 1;
+        snprintf(buf, sizeof buf, "%s", ABLATION[r][1]);
+        for (char *t = strtok(buf, " "); t && argc < 32; t = strtok(NULL, " ")) argv[argc++] = t;
+        plx_args a = {argc, argv};
+        plx_desc_params dp = desc_from_args(&a);
+        plx_match_cfg mc = match_from_args(&a);
+        bool sup = plx_arg_str(&a, "sup", NULL) != NULL;
+        if (!sup) mc.sup = PLX_SUP_NONE;
+        char key[1200];
+        cache_key(ds, &dp, key, sizeof key);
+        if (strcmp(key, have) != 0) {
+            free(x);
+            free(cw);
+            descriptors(ds, &dp, out, false, &x, &cw);
+            snprintf(have, sizeof have, "%s", key);
+        }
+        plx_desc_layout lay = plx_desc_layout_of(&dp);
+        plx_feats all = {.n = ds->db.n_images, .d = lay.d, .n_cells = lay.n_cells, .x = x, .cw = cw};
+        double *score[2] = {PLX_NEW(double, ds->dev_test.n), sup ? PLX_NEW(double, ds->dev_test.n) : NULL};
+        plx_verif_report rep[2];
+        int rc = plx_rec_eval_view1(&mc, &lay, &all, &ds->dev_train, &ds->dev_test, &ds->db, score[0], score[1],
+                                    &rep[0], &rep[1]);
+        if (rc != PLX_OK) plx_die("ablation row %zu failed", r);
+        fprintf(f, "%-46s %.4f / %.4f   ", ABLATION[r][0], rep[0].mean_acc, rep[0].auc);
+        if (sup) fprintf(f, "%.4f / %.4f   ", rep[1].mean_acc, rep[1].auc);
+        else fprintf(f, "%-17s  ", "-");
+        fprintf(f, "%s\n", ABLATION[r][1][0] ? ABLATION[r][1] : "(defaults)");
+        fflush(f);
+        plx_log("ablation %zu: %s  unsup %.4f", r, ABLATION[r][0], rep[0].mean_acc);
+        free(score[0]);
+        free(score[1]);
+    }
+    free(x);
+    free(cw);
+    fclose(f);
+    plx_log("wrote %s", path);
+}
+
 int main(int argc, char **argv) {
     plx_args a = {argc, argv};
     const char *out = plx_arg_str(&a, "out", NULL);
@@ -454,6 +529,7 @@ int main(int argc, char **argv) {
 
     run_view(&ev, &mc, false);
     if (plx_arg_flag(&a, "view2")) run_view(&ev, &mc, true);
+    if (plx_arg_flag(&a, "ablation")) ablation(&ds, out);
     fprintf(rep, "# total %.1fs\n", plx_now() - t_start);
     fclose(rep);
     plx_log("wrote %s/report.txt", out);

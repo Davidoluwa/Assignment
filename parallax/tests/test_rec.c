@@ -80,11 +80,11 @@ TEST(sim_affine_hand_points) {
 
 TEST(identity_texture_is_centre_crop) {
     plx_img g = textured(250, 250, 1);
-    plx_img tex = plx_img_new(PLX_CANON_W, PLX_CANON_H, 1), conf = plx_img_new(PLX_CANON_W, PLX_CANON_H, 1);
+    plx_img tex = plx_img_new(PLX_REC_TEX_W, PLX_REC_TEX_H, 1), conf = plx_img_new(PLX_REC_TEX_W, PLX_REC_TEX_H, 1);
     plx_rec_texture_sim(&g, (const float[4]){1, 0, 0, 0}, &tex, &conf);
     float md = 0, cmin = 1;
-    for (int y = 0; y < PLX_CANON_H; y++)
-        for (int x = 0; x < PLX_CANON_W; x++) {
+    for (int y = 0; y < PLX_REC_TEX_H; y++)
+        for (int x = 0; x < PLX_REC_TEX_W; x++) {
             md = fmaxf(md, fabsf(PLX_PX(&tex, x, y, 0) - PLX_PX(&g, x + 61, y + 49, 0)));
             cmin = fminf(cmin, PLX_PX(&conf, x, y, 0));
         }
@@ -92,7 +92,7 @@ TEST(identity_texture_is_centre_crop) {
     CHECK(cmin == 1.0f);
     /* a translation that pushes the frame off the photo leaves zero confidence there */
     plx_rec_texture_sim(&g, (const float[4]){1, 0, 100, 0}, &tex, &conf);
-    CHECK(PLX_PX(&conf, PLX_CANON_W - 1, 80, 0) == 0.0f && PLX_PX(&conf, 0, 80, 0) == 1.0f);
+    CHECK(PLX_PX(&conf, PLX_REC_TEX_W - 1, 80, 0) == 0.0f && PLX_PX(&conf, 0, 80, 0) == 1.0f);
     plx_img_free(&g);
     plx_img_free(&tex);
     plx_img_free(&conf);
@@ -107,7 +107,7 @@ static plx_img affine_copy(const plx_img *im, float gain, float offset) {
 }
 
 TEST(photometric_invariances) {
-    plx_img t = textured(PLX_CANON_W, PLX_CANON_H, 2);
+    plx_img t = textured(PLX_REC_TEX_W, PLX_REC_TEX_H, 2);
     plx_photo_params p = plx_photo_default();
     plx_img a = plx_img_clone(&t), b = affine_copy(&t, 0.6f, 0.0f);
     plx_photo_normalize(&a, NULL, &p);
@@ -127,7 +127,7 @@ TEST(photometric_invariances) {
 }
 
 TEST(descriptor_photometric_invariance) {
-    plx_img t = textured(PLX_CANON_W, PLX_CANON_H, 3);
+    plx_img t = textured(PLX_REC_TEX_W, PLX_REC_TEX_H, 3);
     plx_img g = affine_copy(&t, 0.6f, 0.0f), go = affine_copy(&t, 0.6f, 0.1f);
     plx_desc_params p = params_with("lbp1:8,lbp2:8,lbp2@1:8,ori:8");
     plx_desc_layout L = plx_desc_layout_of(&p);
@@ -152,14 +152,14 @@ TEST(descriptor_photometric_invariance) {
 }
 
 TEST(descriptor_weights) {
-    plx_img t = textured(PLX_CANON_W, PLX_CANON_H, 4);
+    plx_img t = textured(PLX_REC_TEX_W, PLX_REC_TEX_H, 4);
     plx_desc_params p = params_with("lbp1:8,lbp2:8,ori:8");
     plx_desc_layout L = plx_desc_layout_of(&p);
     float *d0 = PLX_NEW(float, L.d), *d1 = PLX_NEW(float, L.d), *w0 = PLX_NEW(float, L.n_cells),
           *w1 = PLX_NEW(float, L.n_cells);
     plx_desc_compute(&p, &t, NULL, d0, w0);
     /* uniform weights, whatever their level, give the unweighted descriptor */
-    plx_img conf = plx_img_new(PLX_CANON_W, PLX_CANON_H, 1);
+    plx_img conf = plx_img_new(PLX_REC_TEX_W, PLX_REC_TEX_H, 1);
     plx_img_fill(&conf, 0.7f);
     plx_desc_compute(&p, &t, &conf, d1, w1);
     CHECK(max_diff(d0, d1, L.d) < 1e-5f);
@@ -176,10 +176,10 @@ TEST(descriptor_weights) {
      * cannot see it (LBP reach 2 px + DoG reach 6 px, contrast means are confidence-weighted) */
     plx_desc_params pl = params_with("lbp1:8,lbp2:8");
     plx_desc_layout LL = plx_desc_layout_of(&pl);
-    for (int y = 0; y < PLX_CANON_H; y++)
-        for (int x = 0; x < PLX_CANON_W; x++) PLX_PX(&conf, x, y, 0) = x < 56 ? 0.0f : 1.0f;
+    for (int y = 0; y < PLX_REC_TEX_H; y++)
+        for (int x = 0; x < PLX_REC_TEX_W; x++) PLX_PX(&conf, x, y, 0) = x < 56 ? 0.0f : 1.0f;
     plx_img t2 = plx_img_clone(&t);
-    for (int y = 0; y < PLX_CANON_H; y++)
+    for (int y = 0; y < PLX_REC_TEX_H; y++)
         for (int x = 0; x < 40; x++) PLX_PX(&t2, x, y, 0) = 0.9f - 0.8f * PLX_PX(&t2, x, y, 0);
     plx_desc_compute(&pl, &t, &conf, d0, w0);
     plx_desc_compute(&pl, &t2, &conf, d1, w1);
