@@ -14,9 +14,9 @@ enum { NLAT = PLX_RL_LAT_NODES, DOF = 2 * NLAT };
 
 plx_rl_params plx_rl_default(const plx_cg_params *cg) {
     plx_rl_params p = {.cg = *cg, .n_stages = 3, .lambda = 0.1f, .eta = 0.8f, .core = plx_core_default()};
-    p.stages[0] = (plx_rl_stage){.level = 1, .sigma = 4.0f, .iters = 3};
+    p.stages[0] = (plx_rl_stage){.level = 1, .sigma = 4.0f, .iters = 2};
     p.stages[1] = (plx_rl_stage){.level = 0, .sigma = 2.0f, .iters = 3};
-    p.stages[2] = (plx_rl_stage){.level = 0, .sigma = 1.5f, .iters = 2};
+    p.stages[2] = (plx_rl_stage){.level = 0, .sigma = 1.5f, .iters = 3};
     return p;
 }
 
@@ -212,14 +212,14 @@ typedef struct {
     float               *ds;   /* refinement: per-photo step; NULL: relief regression */
 } pass_ctx;
 
+/* One photo's terms of steps 2-3 (relief.h): its numerator map n_i into N (and (G * (n_i + n_i∘σ))²
+ * into Q), its normaliser into D; or, when refining, its own yaw step. */
 static void regress(const pass_ctx *c, int64_t i, int tid, const plx_cg_view *v) {
     const level_ref *r = c->ref;
     int K = r->K, w = r->w, h = r->h;
     size_t plane = r->plane;
     const plx_img *F = &v->feat.lev[r->L], *V = &v->vpyr.lev[r->L];
     PLX_ASSERT(F->w == w && F->h == h && F->c == K);
-    plx_img gx = plx_img_new(w, h, K), gy = plx_img_new(w, h, K);
-    plx_gradient_scharr(F, &gx, &gy);
     double s = c->d->s[i], c2 = (double)c->p->cg.huber * c->p->cg.huber * K, gn = 0, gd = 0;
     double *st = c->stat + (size_t)tid * NSTAT;
     plx_img m = c->ds ? (plx_img){0} : plx_img_new(w, h, 1);
@@ -232,22 +232,16 @@ static void regress(const pass_ctx *c, int64_t i, int tid, const plx_cg_view *v)
             e2 += d * d * r->inv[k * plane + o];
         }
         double hw = e2 <= c2 ? 1.0 : sqrt(c2 / e2), wt = r->omega[o] * vv;
-        static int variant = -1;
-        if (variant < 0) variant = getenv("PLX_RL_VARIANT") ? atoi(getenv("PLX_RL_VARIANT")) : 0;
-        for (int k = 0; k < K; k++) {
-            /* ∂x F in full-resolution units; the residual enters Huber-clipped */
-            double g = gx.px[k * plane + o] / r->lev, d = F->px[k * plane + o] - r->mu[k * plane + o];
-            double gm = r->gmu[k * plane + o];
-            if (variant == 0) nn += r->inv[k * plane + o] * g * hw * d, dd += r->inv[k * plane + o] * g * g;
-            if (variant == 1) nn += r->inv[k * plane + o] * g * hw * d, dd += r->inv[k * plane + o] * gm * gm;
-            if (variant == 2) nn += r->inv[k * plane + o] * gm * hw * d, dd += r->inv[k * plane + o] * gm * gm;
-            if (variant == 3) nn += r->inv[k * plane + o] * g * hw * d, dd += r->inv[k * plane + o] * g * gm;
+        for (int k = 0; k < K; k++) { /* the residual enters Huber-clipped; ∂x μ is the instrument */
+            double gm = r->gmu[k * plane + o], d = F->px[k * plane + o] - r->mu[k * plane + o];
+            nn += r->inv[k * plane + o] * gm * hw * d;
+            dd += r->inv[k * plane + o] * gm * gm;
         }
         st[0] += wt, st[1] += wt * e2, st[2] += wt * hw;
-        if (c->ds) { /* b = v_hr ∂x F */
+        if (c->ds) { /* b = v_hr ∂x μ */
             gn += wt * r->vhr[o] * nn;
             gd += wt * r->vhr[o] * r->vhr[o] * dd;
-        } else { /* b = s ∂x F */
+        } else { /* b = s ∂x μ */
             m.px[o] = (float)(wt * s * nn);
             c->D[(size_t)tid * plane + o] += wt * s * s * dd;
         }
@@ -266,8 +260,6 @@ static void regress(const pass_ctx *c, int64_t i, int tid, const plx_cg_view *v)
         plx_img_free(&ms);
     }
     plx_img_free(&m);
-    plx_img_free(&gx);
-    plx_img_free(&gy);
 }
 
 static void pass_one(int64_t i, int tid, void *pc) {
@@ -369,14 +361,26 @@ static double solve_step(const pass_out *po, const level_ref *r, const plx_rl_pa
     double lam = p->lambda * level_core_mean(gd, r, p->cg.margin, p->core);
     plx_img GN = level_to_omega(gn, w, h, p->cg.margin), Q = level_to_omega(q, w, h, p->cg.margin);
     *support = level_to_omega(gd, w, h, p->cg.margin);
+    size_t np = (size_t)PLX_CANON_W * PLX_CANON_H;
+    for (size_t k = 0; k < np; k++) support->px[k] = fmaxf(support->px[k], 0.0f);
+    /* the prior target: w's support-weighted smooth extension (0 = plain shrinkage to zero) */
+    plx_img prior = plx_img_new(PLX_CANON_W, PLX_CANON_H, 1);
+    if (p->prior_sigma > 0) {
+        plx_img dwt = plx_img_new(PLX_CANON_W, PLX_CANON_H, 1), dd2 = plx_img_clone(support);
+        for (size_t k = 0; k < np; k++) dwt.px[k] = support->px[k] * wcur->px[k];
+        plx_blur(&dwt, &dwt, p->prior_sigma);
+        plx_blur(&dd2, &dd2, p->prior_sigma);
+        for (size_t k = 0; k < np; k++) prior.px[k] = (float)(dwt.px[k] / (dd2.px[k] + lam));
+        plx_img_free(&dwt), plx_img_free(&dd2);
+    }
     *dw = plx_img_new(PLX_CANON_W, PLX_CANON_H, 1);
     *se = plx_img_new(PLX_CANON_W, PLX_CANON_H, 1);
-    for (size_t k = 0; k < (size_t)PLX_CANON_W * PLX_CANON_H; k++) {
-        double den = fmax(support->px[k], 0.0f) + lam;
-        support->px[k] = fmaxf(support->px[k], 0.0f);
-        dw->px[k] = (float)(-(GN.px[k] + lam * wcur->px[k]) / den);
+    for (size_t k = 0; k < np; k++) {
+        double den = support->px[k] + lam;
+        dw->px[k] = (float)(-(GN.px[k] + lam * (wcur->px[k] - prior.px[k])) / den);
         se->px[k] = (float)(Q.px[k] / den);
     }
+    plx_img_free(&prior);
     free(gn), free(gd), free(q);
     plx_img_free(&n), plx_img_free(&dd), plx_img_free(&GN), plx_img_free(&Q);
     return lam;

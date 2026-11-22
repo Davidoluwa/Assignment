@@ -17,35 +17,59 @@
  *   1. render C_i = I_i o W_i on Ω+ with the current w, orientation channels F_i; accumulate the
  *      next template (mean μ, variance σ², mirror-symmetrised exactly as congealing does);
  *   2. residual against the current template r_ik = F_ik - μ_k;
- *   3. forward-additive Lucas-Kanade with the population as the window: we want Δw with
- *      C_i(p + s_i Δw x̂) ≈ μ(p); F_ik(p + s_i Δw x̂) ≈ F_ik + s_i Δw ∂x F_ik, so with
- *      b_ik = s_i ∂x F_ik (the photo's OWN gradient: every nose edge is sharp in its own photo,
- *      while the template's is blurred by exactly the misalignment being measured) and
- *      ω_k = 1/(σ²_k + ε) (times the window and the validity of the sample)
+ *   3. Lucas-Kanade with the population as the window: we want Δw with C_i(p + s_i Δw x̂) ≈ μ(p).
+ *      With b_ik = s_i ∂x μ_k (see THE GRADIENT below) and ω_k = 1/(σ²_k + ε) (times congealing's
+ *      window and the validity of the sample)
  *          N(p) = Σ_i Σ_k ω_k b_ik ψ(r_ik),   D(p) = Σ_i Σ_k ω_k b_ik²,
  *      ψ the Huber clipping of the pixel's normalised residual vector (flow.h's rule);
  *   4. mirror twins. The twin of photo i is the flipped photo with s -> -s; its features are
- *      F'_k(p) = F_π(k)(σp) (π the orientation-channel permutation), so ∂x F'_k(p) =
- *      -(∂x F_π(k))(σp) and b'_k(p) = (-s)(-∂x F_π(k)(σp)) = b_π(k)(σp); the symmetric template
- *      gives r'_k(p) = r_π(k)(σp) and ω_k(p) = ω_π(k)(σp). The Huber factor depends on the sum
- *      over k only. Summing over k absorbs π: N'(p) = N(σp), D'(p) = D(σp). So N + N∘σ and
- *      D + D∘σ are used: w is exactly even, and every appearance effect that is even in yaw
- *      cancels in N;
- *   5. normalised convolution (the LK window, a few px wide):
- *          Δw = -(G_σ * N) / ((G_σ * D) + λ),     w <- w + η Δw,
- *      λ = lambda · mean of G_σ * D over the core, so w falls to zero where nothing is measured;
- *   6. gauge: span{1, Y0, v} is removed from w by least squares over the core with weights
- *      G_σ * D (1, Y0: the plane gauge of v; v: keeps <v_hr, v> = <v, v>, so the depth scale
- *      cannot trade against the s_i and κ, the yaw angles stay valid);
+ *      F'_k(p) = F_π(k)(σp) (π the orientation-channel permutation) and the template is symmetric,
+ *      μ_k(p) = μ_π(k)(σp), so ∂x μ_k(p) = -∂x μ_π(k)(σp), b'_k(p) = (-s)(-∂x μ_π(k)(σp)) =
+ *      b_π(k)(σp), r'_k(p) = r_π(k)(σp), ω_k(p) = ω_π(k)(σp); the Huber factor depends on the sum
+ *      over k only. Summing over k absorbs π: N'(p) = N(σp), D'(p) = D(σp) (the same holds with the
+ *      photo's own gradient). So N + N∘σ and D + D∘σ are used: w is exactly even, and every
+ *      appearance effect that is even in yaw cancels in N;
+ *   5. normalised convolution (the LK window, a few px wide) with the penalty on the TOTAL layer,
+ *      min Σ (r + b Δw)² + λ (w + Δw)²:
+ *          Δw = -(G_σ * N + λ w) / ((G_σ * D) + λ),     w <- w + η Δw,
+ *      λ = lambda · mean of G_σ * D over the core. At the fixed point w = shrunk regression
+ *      coefficient, so w falls to zero where nothing is measured. (λ on the increment alone,
+ *      -G*N / (G*D + λ), only slows the iteration: its fixed point is G*N = 0 for any λ.)
+ *   6. gauge: the depth part of w is w minus its projection on span{1, Y0, v}, least squares over
+ *      the core with weights G_σ * D (plx_rl_gauge): 1 and Y0 are v's plane gauge (a translation /
+ *      shear of each photo proportional to its yaw), v keeps <v_hr, v> = <v, v>, so κ and the yaw
+ *      angles stay valid. It is NOT imposed on the warp layer inside the loop: with every s_i held
+ *      fixed the data determine the product s_i (v + w) completely, including its components
+ *      along 1, Y0 and v, and projecting them out after every step leaves a misfit the next pass
+ *      asks for again (measured: steps never shrank; on LFW the gauge removed ~0.2 px of constant
+ *      and 3% of v per pass, forever). The scale CAN trade only when s moves (refinement), and
+ *      that is where the scale gauge is applied (plx_relief: the common rescaling of the s steps
+ *      is removed). The warp layer w therefore renders exactly what was fitted; depth outputs use
+ *      the gauged w and report the removed coefficients;
  *   7. coarse to fine: each stage sets the feature pyramid level and the window σ.
  * Each pass also accumulates Q(p) = Σ_i (G_σ * m_i)², m_i = n_i + n_i∘σ the photo's (symmetrised)
  * contribution to N: sqrt(Q) / (G*D + λ) is the sampling standard error of a regression step
  * (photos as the independent units), the denominator of the z-score map.
  *
+ * THE GRADIENT. Write photo i's features as F_i(p) = A_i(p + s_i δ(p)), A_i = shared face +
+ * identity, μ ≈ E[A]. Then r_i ≈ (A_i - μ) + s_i δ ∂x A_i, and with the photo's OWN gradient,
+ * b = s ∂x F_i, the windowed expectation is (integrating the second-order term by parts)
+ *     E[N] ≈ δ Σ s² ∂x F_i ∂x μ,    while   D = Σ s² (∂x F_i)²,
+ * so the own-gradient step is attenuated by (shared gradient energy) / (total gradient energy):
+ * identity texture inflates D and adds noise to N, but carries no information about δ, which is
+ * uncorrelated with identity. On faces that share is small and the iteration crawls (synthetic
+ * face textures: 8 passes recovered corr 0.78, high-pass 0.36). The full-Newton normaliser
+ * Σ s² ∂x F_i ∂x μ is calibrated but not positive and diverged. Since E[∂x F_i] = ∂x μ, the
+ * template gradient is the noise-free instrument: b = s ∂x μ in both N and D (population
+ * inverse compositional). Measured on the same synthetic data: corr 0.96, high-pass 0.76, half
+ * the permutation noise; on 3000 LFW photos split-half corr 0.986 (high-pass 0.979) vs 0.947
+ * (0.920). The worry that the template's edge is blurred by the misalignment being measured is
+ * real but self-correcting: the template is re-accumulated every pass and sharpens as w improves.
+ *
  * Yaw refinement (optional, after w is stable): one Gauss-Newton step per photo on its own s
- * against the sharper model, Δs_i = -Σ ω (v_hr ∂x F_ik) ψ(r_ik) / Σ ω (v_hr ∂x F_ik)². The
- * refined warp is T(p + u + Δs v + s' w): the change along v is a lattice field, carried by
- * plx_rl_data.s_shift. */
+ * against the sharper model, Δs_i = -Σ ω (v_hr ∂x μ) ψ(r_i) / Σ ω (v_hr ∂x μ)² (the same
+ * instrument). The refined warp is T(p + u + Δs v + s' w): the change along v is a lattice field,
+ * carried by plx_rl_data.s_shift. */
 #ifndef PLX_GEOM_RELIEF_H
 #define PLX_GEOM_RELIEF_H
 
@@ -68,11 +92,16 @@ typedef struct {
     int            n_stages;
     plx_rl_stage   stages[PLX_RL_MAX_STAGES];
     float          lambda; /* relative regularisation (step 5) */
+    float          prior_sigma; /* > 0: shrink towards w's support-weighted blur at this σ (px), not 0 */
     float          eta;    /* damping of each update, <= 1 */
     plx_core_shape core;   /* gauge and statistics region (geom.h's ellipse) */
 } plx_rl_params;
-/* From the flow model's parameters: schedule 1:4px x 3, 0:2px x 3, 0:1.5px x 2, lambda 0.1,
- * eta 0.8, the default core ellipse. */
+/* From the flow model's parameters: schedule 1:4px x 2, 0:2px x 3, 0:1.5px x 3, lambda 0.1,
+ * eta 0.8, the default core ellipse. Chosen by measurement (apps/plx_relief.c's summary has the
+ * sweep): on synthetic known relief λ 0.03 is noisier (permutation rms +50%) and λ 0.3 biased
+ * (corr 0.92 vs 0.96); η = 1 oscillates; on 3000 LFW photos a final window of 1.5 px keeps
+ * lowering the population feature variance against 2 px at split-half high-pass agreement 0.979
+ * vs 0.981, while 1 px had not converged in two passes. */
 plx_rl_params plx_rl_default(const plx_cg_params *cg);
 
 typedef struct {
@@ -93,11 +122,11 @@ typedef struct {
     double cost, inlier;                    /* mean e² = Σ_k r²/(σ²+ε) and Huber weight over the samples */
     double lambda_abs;                      /* λ in units of D */
     double step_rms, step_max, w_rms;       /* η Δw and w over the core, units of v */
-    double gauge[3];                        /* removed (α, γ, c) of α + γ Y0 + c v */
+    double gauge[3];                        /* (α, γ, c): w's projection on 1, Y0, v (step 6) */
 } plx_rl_iter;
 
 typedef struct {
-    plx_img         w;          /* Ω, units of v */
+    plx_img         w;          /* Ω, units of v: the warp layer (ungauged; plx_rl_gauge gives its depth part) */
     plx_img         support;    /* G * (D + D∘σ) of the last iteration, upsampled to Ω */
     plx_img         se;         /* sqrt(Q) / (G*D + λ) of the last iteration, Ω */
     plx_cg_template tmpl;       /* the last accumulated template */

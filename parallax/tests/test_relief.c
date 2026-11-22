@@ -93,14 +93,23 @@ static plx_rl_params mini_params(void) {
     return p;
 }
 
-/* Correlation and RMS error of recovered w against the true relief in the same gauge. */
+/* Depth part (step 6 gauge, the estimate's support as weights) of a map. */
+static plx_img depth_part(const plx_img *w, const plx_rl_synth *s, const plx_rl_result *res, const plx_rl_params *p) {
+    plx_img v = plx_rl_v_dense(s->v_lat), g = plx_img_clone(w);
+    plx_rl_gauge(&g, &v, &res->support, p->core, NULL);
+    plx_img_free(&v);
+    return g;
+}
+
+/* Correlation and RMS error of the recovered depth part against the true relief in the same gauge. */
 static void score(const plx_rl_synth *s, const plx_rl_result *res, const plx_rl_params *p, double *corr, double *rms,
-                  double *rms_true) {
-    plx_img v = plx_rl_v_dense(s->v_lat), wt = plx_img_clone(&s->w_true), zero = plx_img_new(PLX_CANON_W, PLX_CANON_H, 1);
-    plx_rl_gauge(&wt, &v, &res->support, p->core, NULL);
-    plx_rl_compare(&res->w, &wt, p->core, 4.0f, corr, NULL, rms);
+                  double *rms_true, double *rms_w) {
+    plx_img wt = depth_part(&s->w_true, s, res, p), wg = depth_part(&res->w, s, res, p);
+    plx_img zero = plx_img_new(PLX_CANON_W, PLX_CANON_H, 1);
+    plx_rl_compare(&wg, &wt, p->core, 4.0f, corr, NULL, rms);
     plx_rl_compare(&wt, &zero, p->core, 4.0f, NULL, NULL, rms_true);
-    plx_img_free(&v), plx_img_free(&wt), plx_img_free(&zero);
+    plx_rl_compare(&wg, &zero, p->core, 4.0f, NULL, NULL, rms_w);
+    plx_img_free(&wt), plx_img_free(&wg), plx_img_free(&zero);
 }
 
 /* The core test: a small rendered population with a known nose, sockets, brow, lips and chin on a
@@ -115,11 +124,11 @@ TEST(synthetic_relief_recovered) {
     plx_rl_data d = {.src = &s.src, .T = s.T, .u = s.u, .s = s.s, .v_lat = s.v_lat};
     plx_rl_result res;
     plx_rl_estimate(&d, &p, NULL, NULL, false, &res);
-    double corr, rms, rms_true;
-    score(&s, &res, &p, &corr, &rms, &rms_true);
+    double corr, rms, rms_true, rms_w;
+    score(&s, &res, &p, &corr, &rms, &rms_true, &rms_w);
     printf("  synthetic: corr %.3f, rms error %.3f px vs true relief rms %.3f px\n", corr, rms, rms_true);
-    CHECK(corr > 0.8);
-    CHECK(rms < 0.6 * rms_true);
+    CHECK(corr > 0.92);
+    CHECK(rms < 0.4 * rms_true);
     /* exactly mirror-even */
     double asym = 0;
     for (int y = 0; y < PLX_CANON_H; y++)
@@ -137,13 +146,12 @@ TEST(synthetic_relief_recovered) {
     dp.s = sp;
     plx_rl_result rp;
     plx_rl_estimate(&dp, &p, NULL, NULL, false, &rp);
-    double rms_perm, z;
-    plx_img zero = plx_img_new(PLX_CANON_W, PLX_CANON_H, 1);
-    plx_rl_compare(&rp.w, &zero, p.core, 4.0f, NULL, NULL, &rms_perm);
-    plx_rl_compare(&res.w, &zero, p.core, 4.0f, NULL, NULL, &z);
-    printf("  permuted s: w rms %.3f px vs %.3f px with the true s\n", rms_perm, z);
-    CHECK(rms_perm < 0.25 * z);
-    plx_img_free(&zero);
+    double c_perm, e_perm, t_perm, rms_perm;
+    score(&s, &rp, &p, &c_perm, &e_perm, &t_perm, &rms_perm);
+    /* (a permutation keeps ~1/sqrt(n) of the true s by chance, so a faint copy of the relief remains) */
+    printf("  permuted s: depth rms %.3f px vs %.3f px with the true s (corr with the truth %.3f)\n", rms_perm, rms_w,
+           c_perm);
+    CHECK(rms_perm < 0.25 * rms_w);
     plx_rl_result_free(&rp);
     free(sp), free(perm);
     plx_rl_result_free(&res);

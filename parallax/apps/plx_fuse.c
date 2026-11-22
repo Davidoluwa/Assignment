@@ -11,7 +11,10 @@
  * the sign / gauge / bas-relief prior; depth_basis.plxt: its per-node personal variance for the
  * posterior), --pack runs/main/pack (gray, rgb: textures and LFW photos), --lfw data/lfw.
  * Options: --step 8|4 (personal lattice), --lambda (personal bending weight), --rounds (personal
- * template rounds), --boot (bootstrap resamples), --threads.
+ * template rounds), --retrack (visibility-aware re-tracking passes), --boot (bootstrap
+ * resamples), --threads. Synthetic mode: --quick (base clip only), and for the base clip
+ * --frames --yaw --nod --shade --noise, --write-clip <path.plxv> (stores it as a container, PPM
+ * payloads, for testing --clip end to end). LFW mode: --min-photos 20, --reps 5.
  *
  * The record layout is documented in fuse/fuse.h. Every report line goes to stdout and to
  * <out>/summary.txt. */
@@ -47,6 +50,13 @@ static const float WHITE[3] = {1, 1, 1}, GREY[3] = {0.6f, 0.6f, 0.6f}, RED[3] = 
 #define CORE_AX 40.0
 #define CORE_AY 50.0
 #define CORE_YC 6.0
+/* Systematic floor of the per-node depth error, px. The factorisation's bootstrap sd covers track
+ * noise and motion geometry, not tracking bias that is consistent with a rigid shape (the
+ * regularised field under-following a narrow nose, view-dependent appearance). On the synthetic
+ * clips (yaw +-20..30, 10..80 frames, three textures, three heads) the depth error over the core
+ * is 0.4-1.3 px RMS with bootstrap sds near 0.1 px; the record's posterior adds this floor in
+ * quadrature, and the synthetic report gives z-scores with and without it. */
+#define SD_FLOOR_PX 0.6
 
 /* ---- reporting ------------------------------------------------------------------------------------ */
 static FILE *g_sum;
@@ -121,6 +131,7 @@ typedef struct {
     double           prior_var8[17 * 21]; /* per-node prior variance of personal depth, px² */
     plx_fu_track_opts topt;
     plx_fu_factor_opts fopt;
+    int              retrack;          /* visibility-aware personal re-tracking passes */
     const char      *flow, *geom, *pack, *lfw;
 } context;
 
@@ -158,6 +169,7 @@ static void load_context(const plx_args *a, context *cx) {
     cx->topt.rounds = (int)plx_arg_int(a, "rounds", cx->topt.rounds);
     cx->fopt = plx_fu_factor_defaults();
     cx->fopt.boot = (int)plx_arg_int(a, "boot", cx->fopt.boot);
+    cx->retrack = (int)plx_arg_int(a, "retrack", 1);
     if (plx_arg_int(a, "threads", 0) > 0) plx_set_num_threads((int)plx_arg_int(a, "threads", 0));
 }
 
@@ -249,11 +261,23 @@ static void run_clip(const context *cx, const plx_img *frames, int F, const doub
     c->t_ms = PLX_NEW(double, F);
     memcpy(c->t_ms, t_ms, sizeof(double) * F);
     double t0 = plx_now();
-    plx_img g0 = plx_img_luma(&frames[0]);
+    /* the face is searched in up to three frames spread over the clip (a blink or a hand in one
+     * frame must not lose the clip); the best-scoring one defines the window */
     plx_fu_locate_opts lo = plx_fu_locate_defaults();
-    c->loc = plx_fu_locate(&cx->loc, &g0, &lo);
-    plx_img_free(&g0);
+    int best = -1;
+    for (int k = 0; k < PLX_MIN(F, 3); k++) {
+        int f = k * F / 3;
+        plx_img g = plx_img_luma(&frames[f]);
+        plx_fu_located l = plx_fu_locate(&cx->loc, &g, &lo);
+        plx_img_free(&g);
+        if (best < 0 || l.score > c->loc.score) c->loc = l, best = f;
+    }
     c->win = plx_fu_window_for(c->loc.T);
+    plx_log("located the face in frame %d: scale %.3f, window origin (%.1f, %.1f), score %.3f (runner-up %.3f)", best,
+            c->win.s, c->win.x0, c->win.y0, c->loc.score, c->loc.runner_score);
+    /* faces score 0.4-0.55 against the template, the best non-face places ~0.3 (synthetic and
+     * pasted-LFW tests) */
+    if (c->loc.score < 0.2) plx_die("no face found in the clip (best localisation score %.3f)", c->loc.score);
     c->crops = PLX_NEW(plx_img, F);
     c->grays = PLX_NEW(plx_img, F);
     for (int f = 0; f < F; f++) {
@@ -270,24 +294,32 @@ static void run_clip(const context *cx, const plx_img *frames, int F, const doub
     c->x = PLX_NEW(double, (size_t)F * 2 * P);
     c->x_pop = PLX_NEW(double, (size_t)F * 2 * P);
     c->w = PLX_NEW(double, (size_t)F * P);
-    plx_fu_track_positions(&c->tr, false, c->x);
     plx_fu_track_positions(&c->tr, true, c->x_pop);
+    plx_fu_track_positions(&c->tr, false, c->x);
     base_weights(c, c->w);
-    {   /* DEBUG */
-        int bad = 0, badw = 0;
-        for (size_t k = 0; k < (size_t)F * 2 * P; k++) bad += !isfinite(c->x[k]) || !isfinite(c->x_pop[k]);
-        for (size_t k = 0; k < (size_t)F * P; k++) badw += !isfinite(c->w[k]);
-        plx_log("DEBUG loc T %g %g %g %g cost %g; bad x %d bad w %d; T_pop0 %g %g %g %g", c->loc.T.a, c->loc.T.b, c->loc.T.tx,
-                c->loc.T.ty, c->loc.score, bad, badw, c->tr.T_pop[0].a, c->tr.T_pop[0].b, c->tr.T_pop[0].tx, c->tr.T_pop[0].ty);
-    }
-    plx_fu_tracks tp = tracks_of(c, c->x), tq = tracks_of(c, c->x_pop);
-    if (plx_fu_factorise(&tp, &cx->fopt, &c->sh) != PLX_OK) plx_die("factorisation failed (personal tracks)");
     plx_fu_factor_opts fq = cx->fopt;
     fq.boot = 0;
+    plx_fu_tracks tq = tracks_of(c, c->x_pop), tp = tracks_of(c, c->x);
     if (plx_fu_factorise(&tq, &fq, &c->sh_pop) != PLX_OK) plx_die("factorisation failed (population tracks)");
+    c->dense = PLX_NEW(double, (size_t)3 * PLX_CANON_W * PLX_CANON_H);
+    /* visibility-aware re-tracking: the shape so far says which parts of each frame are hidden */
+    for (int it = 0; it < cx->retrack; it++) {
+        plx_fu_shape s0;
+        if (plx_fu_factorise(&tp, &fq, &s0) != PLX_OK) plx_die("factorisation failed (personal tracks)");
+        plx_fu_dense_surface(&c->nd.L, s0.S, s0.used, true, c->dense);
+        float *vis = PLX_NEW(float, (size_t)F * PLX_CANON_W * PLX_CANON_H);
+        plx_fu_visibility(&s0, c->dense, PLX_CANON_IMG_SIDE, PLX_CANON_IMG_SIDE, vis);
+        plx_fu_shape_free(&s0);
+        double t1 = plx_now();
+        plx_fu_track_retrack(&cx->fitter, c->grays, vis, &cx->topt, &c->tr);
+        c->seconds[1] += plx_now() - t1;
+        free(vis);
+        plx_fu_track_positions(&c->tr, false, c->x);
+        base_weights(c, c->w);
+    }
+    if (plx_fu_factorise(&tp, &cx->fopt, &c->sh) != PLX_OK) plx_die("factorisation failed (personal tracks)");
     c->seconds[2] = plx_now() - t0;
     t0 = plx_now();
-    c->dense = PLX_NEW(double, (size_t)3 * PLX_CANON_W * PLX_CANON_H);
     plx_fu_dense_surface(&c->nd.L, c->sh.S, c->sh.used, true, c->dense);
     plx_fu_fuse_texture(c->crops, F, &c->tr, &c->sh, c->dense, &c->texture, &c->texture_w);
     c->seconds[3] = plx_now() - t0;
@@ -354,11 +386,12 @@ static void make_record(const context *cx, const clip_run *c, plx_fu_record *r) 
     for (int n = 0; n < P8; n++) {
         int i = n / L8.nx, j = n % L8.nx, m = (i * ratio) * c->nd.L.nx + j * ratio;
         for (int k = 0; k < 7; k++) r->shape[(size_t)k * P8 + n] = r->shape_lat[(size_t)k * P + m];
-        /* DESIGN §5.5 / §8: precisions add (per node: the record keeps the diagonal) */
+        /* DESIGN §5.5 / §8: precisions add (per node: the record keeps the diagonal); the clip's
+         * variance is the bootstrap's plus the systematic floor */
         double z = r->shape[2 * P8 + n], sd = r->shape[5 * P8 + n], v0 = cx->prior_var8[n];
-        if (isfinite(z) && isfinite(sd) && sd > 0) {
-            double prec = 1 / v0 + 1 / (sd * sd);
-            r->post[n] = (float)((cx->zbar8[n] / v0 + z / (sd * sd)) / prec);
+        if (isfinite(z) && isfinite(sd)) {
+            double v1 = sd * sd + SD_FLOOR_PX * SD_FLOOR_PX, prec = 1 / v0 + 1 / v1;
+            r->post[n] = (float)((cx->zbar8[n] / v0 + z / v1) / prec);
             r->post[P8 + n] = (float)sqrt(1 / prec);
         } else {
             r->post[n] = (float)cx->zbar8[n];
@@ -397,12 +430,13 @@ static void make_record(const context *cx, const clip_run *c, plx_fu_record *r) 
              "plx_fuse_record 1\nframes %d\nchannels %d\nlattice_step %d\nwindow %.6f %.6f %.6f\n"
              "locate_score %.4f\nlocate_runner_score %.4f\nreproj_rms_px %.4f\ntrack_sigma_px %.4f\n"
              "metric_gap %.6g\nL_min_eig %.6g\nrotation_spread_deg %.3f %.3f %.3f\ndegenerate %d\n"
-             "depth_ratio %.4f\nprior_scale %.4f\ndepth_scale_sd %.4f\nmirror_corr %.4f %.4f\ngauge_rms_px %.4f\n"
+             "depth_ratio %.4f\nmetric_depth_scale_sd %.4f\nprior_weight %.4f\nprior_scale %.4f\n"
+             "depth_scale_sd %.4f\nmirror_corr %.4f %.4f\ngauge_rms_px %.4f\nsd_floor_px %.3f\n"
              "nose_protrusion_px %.3f\ntrack_cost_population %.4f\ntrack_cost_personal %.4f\nnodes_used %d\n",
              F, r->C, (int)c->nd.L.step, c->win.s, c->win.x0, c->win.y0, c->loc.score, c->loc.runner_score, sh->rms,
              sh->sigma, sh->gap, sh->L_min_eig, sh->spread_deg[0], sh->spread_deg[1], sh->spread_deg[2],
-             (int)sh->degenerate, sh->depth_ratio, sh->prior_scale, sh->scale_sd, sh->corr, sh->corr_mirror,
-             sh->gauge_rms, protrusion(&n8, zc), cpp, cp, n_used);
+             (int)sh->degenerate, sh->depth_ratio, sh->scale_sd_metric, sh->prior_weight, sh->prior_scale, sh->scale_sd,
+             sh->corr, sh->corr_mirror, sh->gauge_rms, SD_FLOOR_PX, protrusion(&n8, zc), cpp, cp, n_used);
     nodes_free(&n8);
     r->info = info;
 }
@@ -556,7 +590,8 @@ static plx_img clip_diag(const clip_run *c, const double *true_ang) {
         const char *lab[7] = {"population fits", "personal template", "fused texture", "depth z", "z - zbar", "sd(z)", "non-rigid rms"};
         rows[1] = labelled_row(t, lab, 7, 2);
         for (int k = 0; k < 7; k++) plx_img_free(&t[k]);
-        titles[1] = "mean faces, fused texture, depth (Ω), depth minus the population mean, bootstrap sd, per-node residual";
+        titles[1] = "mean faces, fused texture, depth (canonical frame), depth minus the population mean, bootstrap sd, "
+                    "per-node residual";
     }
     /* 3: renders at novel poses */
     {
@@ -624,8 +659,9 @@ static void report_clip(const clip_run *c) {
     say("  factorisation: %d nodes; rotation spreads %.2f / %.2f / %.2f deg; metric gap %.2e; L min eig %.3f; "
         "mirror corr %.3f (rejected twin %.3f)\n",
         nu, s->spread_deg[0], s->spread_deg[1], s->spread_deg[2], s->gap, s->L_min_eig, s->corr, s->corr_mirror);
-    say("  depth ratio to zbar %.3f; degenerate %s (prior scale %.3f); bootstrap depth-scale sd %.3f (%d resamples)\n",
-        s->depth_ratio, s->degenerate ? "YES" : "no", s->prior_scale, s->scale_sd, s->n_boot);
+    say("  depth ratio to zbar %.3f; metric depth-scale sd %.3f -> prior weight %.3f, scale factor %.3f, degenerate %s;"
+        " final depth-scale sd %.3f (%d resamples)\n", s->depth_ratio, s->scale_sd_metric, s->prior_weight,
+        s->prior_scale, s->degenerate ? "YES" : "no", s->scale_sd, s->n_boot);
     say("  nose protrusion %.2f px (population zbar %.2f px); time locate %.1f s, track %.1f s, factor %.1f s, fuse %.1f s\n",
         protrusion(&c->nd, s->S + 2 * c->nd.P), protrusion(&c->nd, c->nd.zp), c->seconds[0], c->seconds[1],
         c->seconds[2], c->seconds[3]);
@@ -650,6 +686,10 @@ static int run_clip_mode(const plx_args *a) {
     plx_fu_record r;
     make_record(&cx, &c, &r);
     if (plx_fu_record_save(out, &r) != PLX_OK) plx_die("cannot write the record to %s", out);
+    plx_fu_record back;
+    if (plx_fu_record_load(out, &back) != PLX_OK || back.F != r.F || back.lat.step != r.lat.step)
+        plx_die("the record in %s does not read back", out);
+    plx_fu_record_free(&back);
     plx_img d = clip_diag(&c, NULL);
     save_png(out, "diag.png", &d);
     plx_img_free(&d);
@@ -673,6 +713,7 @@ typedef struct {
     double scale_ratio;                             /* ⟨z_rec, z_true⟩ / ⟨z_true, z_true⟩ (centred) */
     double track_pop, track_pers;                   /* RMS track error vs consistent true points, px */
     double zscore_rms;                              /* RMS of (z_rec - z_true) / sd */
+    double zscore_floor_rms;                        /* the same with SD_FLOOR_PX added in quadrature */
     double loc_err, loc_scale;                      /* localisation: centre error px, scale ratio */
 } synth_eval;
 
@@ -789,7 +830,7 @@ static void eval_depth(const plx_fu_head *h, const nodes *nd, const plx_fu_shape
     compare(P, ha, ht, w, &ev->hp_corr, &ev->hp_rms);
     ev->nose_true = protrusion(nd, zt);
     ev->nose_rec = protrusion(nd, za);
-    double W = 0, ma = 0, mt = 0, ab = 0, bb = 0, z2 = 0;
+    double W = 0, ma = 0, mt = 0, ab = 0, bb = 0, z2 = 0, z2f = 0;
     int nz = 0;
     for (int n = 0; n < P; n++)
         if (w[n] > 0) W += 1, ma += za[n], mt += zt[n];
@@ -797,11 +838,12 @@ static void eval_depth(const plx_fu_head *h, const nodes *nd, const plx_fu_shape
     for (int n = 0; n < P; n++)
         if (w[n] > 0) {
             ab += (za[n] - ma) * (zt[n] - mt), bb += (zt[n] - mt) * (zt[n] - mt);
-            double sd = s * sh->sd[2 * P + n];
-            if (isfinite(sd) && sd > 0) z2 += (za[n] - zt[n]) * (za[n] - zt[n]) / (sd * sd), nz++;
+            double sd = s * sh->sd[2 * P + n], e2 = (za[n] - zt[n]) * (za[n] - zt[n]);
+            if (isfinite(sd) && sd > 0) z2 += e2 / (sd * sd), z2f += e2 / (sd * sd + SD_FLOOR_PX * SD_FLOOR_PX), nz++;
         }
     ev->scale_ratio = ab / bb;
     ev->zscore_rms = nz ? sqrt(z2 / nz) : NAN;
+    ev->zscore_floor_rms = nz ? sqrt(z2f / nz) : NAN;
     free(T), free(S), free(w), free(za), free(ha), free(ht);
 }
 
@@ -851,12 +893,94 @@ static void eval_clip(const plx_fu_head *h, const plx_fu_synth_opts *o, const cl
     free(XY), free(err), free(XYp);
 }
 
+/* Person-specific depth recovered? m = mean of the heads' true depths at the correspondences; the
+ * reconstruction is aligned to (X, Y, m) and correlated with head j over the core: corr(z - m, z_j - m). */
+static double deviation_corr(const plx_fu_head *heads, int nh, int j, const nodes *nd, const plx_fu_shape *sh,
+                             const double *XY) {
+    int P = nd->P;
+    double *T = PLX_NEW(double, (size_t)3 * P), *S = PLX_NEW(double, (size_t)3 * P), *w = PLX_NEW(double, P);
+    double *dz = PLX_NEW(double, P), *dj = PLX_NEW(double, P), s, R[9], t[3];
+    for (int n = 0; n < P; n++) {
+        double m = 0, zj = NAN;
+        for (int h = 0; h < nh; h++) {
+            double z = plx_fu_head_depth(&heads[h], XY[n], XY[P + n]);
+            m += z / nh;
+            if (h == j) zj = z;
+        }
+        w[n] = sh->used[n] && nd->core[n] && isfinite(m);
+        T[n] = w[n] ? XY[n] : 0, T[P + n] = w[n] ? XY[P + n] : 0, T[2 * P + n] = w[n] ? m : 0;
+        for (int r = 0; r < 3; r++) S[r * P + n] = w[n] ? sh->S[r * P + n] : 0;
+        dj[n] = zj - m;
+    }
+    plx_fu_procrustes(P, S, T, w, &s, R, t);
+    for (int n = 0; n < P; n++) dz[n] = s * (R[6] * S[n] + R[7] * S[P + n] + R[8] * S[2 * P + n]) + t[2] - T[2 * P + n];
+    double c;
+    compare(P, dz, dj, w, &c, NULL);
+    free(T), free(S), free(w), free(dz), free(dj);
+    return c;
+}
+
+/* The metric upgrade's conditioning on its own: oracle tracks (true projections of the head's
+ * lattice nodes plus noise, no tracker), yaw amplitude x nod amplitude. */
+static void oracle_sweep(const context *cx, const plx_fu_head *h) {
+    plx_lattice L8 = plx_lattice_make(PLX_FL_STEP);
+    nodes nd;
+    nodes_make(cx, &L8, &nd);
+    int P = nd.P, F = 40, nseed = 6;
+    double yaws[5] = {3, 5, 10, 20, 30}, nods[4] = {0, 2, 5, 10};
+    double *XY = PLX_NEW(double, (size_t)2 * P), *x = PLX_NEW(double, (size_t)F * 2 * P), *w = PLX_NEW(double, (size_t)F * P);
+    for (int n = 0; n < P; n++) XY[n] = nd.X0[n], XY[P + n] = nd.Y0[n];
+    say("  %6s %5s %9s %9s %9s %9s %8s\n", "yaw+-", "nod+-", "scale", "sd_seeds", "sd_boot", "prior_w", "hpcorr");
+    for (int iy = 0; iy < 5; iy++)
+        for (int in = 0; in < 4; in++) {
+            double sc[8], sb = 0, hc = 0;
+            for (int sd = 0; sd < nseed; sd++) {
+                plx_fu_synth_opts o = plx_fu_synth_defaults();
+                o.F = F, o.yaw_deg = yaws[iy], o.pitch_deg = nods[in], o.roll_deg = 0, o.seed = 100 + sd;
+                plx_rng r;
+                plx_rng_seed(&r, o.seed);
+                for (int f = 0; f < F; f++) {
+                    plx_fu_pose p = plx_fu_synth_pose(&o, f);
+                    for (int n = 0; n < P; n++) {
+                        double px, py;
+                        plx_fu_synth_project(h, &o, p, nd.X0[n], nd.Y0[n], &px, &py);
+                        bool ok = nd.track[n] && isfinite(px);
+                        x[((size_t)f * 2) * P + n] = ok ? px + 0.2 * plx_rng_normal(&r) : 0;
+                        x[((size_t)f * 2 + 1) * P + n] = ok ? py + 0.2 * plx_rng_normal(&r) : 0;
+                        w[(size_t)f * P + n] = ok;
+                    }
+                }
+                plx_fu_tracks tr = {.F = F, .P = P, .nx = nd.L.nx, .ny = nd.L.ny, .img_w = 250, .img_h = 250, .x = x,
+                                    .w = w, .X0 = nd.X0, .Y0 = nd.Y0, .zp = nd.zp, .gw = nd.gw};
+                plx_fu_factor_opts fo = cx->fopt;
+                fo.prior_scale = 0, fo.boot = 16, fo.seed = 7 + sd;
+                plx_fu_shape sh;
+                synth_eval ev;
+                double Rq[9];
+                if (plx_fu_factorise(&tr, &fo, &sh) != PLX_OK) {
+                    sc[sd] = NAN;
+                    continue;
+                }
+                eval_depth(h, &nd, &sh, XY, &ev, Rq);
+                sc[sd] = ev.scale_ratio, sb += sh.scale_sd / nseed, hc += ev.hp_corr / nseed;
+                plx_fu_shape_free(&sh);
+            }
+            double m = mean_of(sc, nseed), v = 0;
+            for (int sd = 0; sd < nseed; sd++) v += (sc[sd] - m) * (sc[sd] - m) / (nseed - 1);
+            double pw = sb * sb / (sb * sb + cx->fopt.prior_scale_sd * cx->fopt.prior_scale_sd);
+            say("  %6.0f %5.0f %9.3f %9.3f %9.3f %9.3f %8.3f\n", yaws[iy], nods[in], m, sqrt(v), sb, pw, hc);
+        }
+    free(XY), free(x), free(w);
+    nodes_free(&nd);
+}
+
 /* ---- synthetic mode ------------------------------------------------------------------------------ */
 typedef struct {
     context  *cx;
     plx_img   tex[3];     /* frontalised RGB textures (Ω+, margin 16) */
     int       tex_img[3]; /* their global LFW indices */
     const char *out;
+    const char *write_clip; /* --write-clip: the next clip is also stored as a .plxv there */
 } synth_env;
 
 /* Three near-frontal, trusted LFW photos of different people, frontalised by their population fit. */
@@ -907,6 +1031,26 @@ static clip_run synth_clip(synth_env *se, const plx_fu_head *h, int tex, const p
         t_ms[f] = f * 1000.0 / 30;
     }
     plx_img_free(&bg);
+    if (se->write_clip) { /* the clip as the capture page would deliver it (PPM payloads: no JPEG encoder here) */
+        plx_fu_clip clip = {0};
+        for (int f = 0; f < o->F; f++) {
+            int w = frames[f].w, hh = frames[f].h;
+            char hdr[64];
+            int hl = snprintf(hdr, sizeof hdr, "P6\n%d %d\n255\n", w, hh);
+            size_t len = (size_t)hl + (size_t)3 * w * hh;
+            uint8_t *buf = plx_malloc(len);
+            memcpy(buf, hdr, (size_t)hl);
+            plx_img rgb = plx_viz_to_rgb(&frames[f]);
+            plx_img_to_u8(&rgb, buf + hl, 1.0f / 255);
+            plx_img_free(&rgb);
+            plx_fu_clip_append(&clip, t_ms[f], buf, len);
+            free(buf);
+        }
+        if (plx_fu_clip_write(se->write_clip, &clip) != PLX_OK) plx_die("cannot write %s", se->write_clip);
+        plx_log("wrote %s (%d frames)", se->write_clip, clip.n);
+        plx_fu_clip_free(&clip);
+        se->write_clip = NULL;
+    }
     clip_run c;
     run_clip(se->cx, frames, o->F, t_ms, &c);
     eval_clip(h, o, &c, ev);
@@ -931,19 +1075,23 @@ static clip_run synth_clip(synth_env *se, const plx_fu_head *h, int tex, const p
 }
 
 static void eval_header(void) {
-    say("  %-22s %6s %6s %6s %6s %6s %6s %6s %6s %6s %6s %6s %6s %6s %5s\n", "clip", "corr", "rms", "hpcorr", "hprms",
-        "nose", "true", "scale", "yaw", "pitch", "roll", "reproj", "trkpop", "trkper", "zsc");
+    say("  %-20s %6s %5s %6s %5s %5s %5s %6s %5s %5s %5s %6s %6s %6s %6s %5s %5s\n", "clip", "corr", "rms", "hpcorr",
+        "hprms", "nose", "true", "scale", "yaw", "pitch", "roll", "reproj", "trkpop", "trkper", "sd_z", "zsc", "zsc_f");
 }
 
 static void eval_line(const char *label, const synth_eval *e, const clip_run *c) {
-    say("  %-22s %6.3f %6.2f %6.3f %6.2f %6.1f %6.1f %6.3f %6.2f %6.2f %6.2f %6.3f %6.3f %6.3f %5.2f%s\n", label,
-        e->depth_corr, e->depth_rms, e->hp_corr, e->hp_rms, e->nose_rec, e->nose_true, e->scale_ratio, e->yaw_rms,
-        e->pitch_rms, e->roll_rms, c->sh.rms, e->track_pop, e->track_pers, e->zscore_rms,
-        c->sh.degenerate ? "  [degenerate: prior scale]" : "");
+    double sdm = 0;
+    int n = 0;
+    for (int k = 0; k < c->nd.P; k++)
+        if (c->sh.used[k] && c->nd.core[k] && isfinite(c->sh.sd[2 * c->nd.P + k])) sdm += c->sh.sd[2 * c->nd.P + k], n++;
+    say("  %-20s %6.3f %5.2f %6.3f %5.2f %5.1f %5.1f %6.3f %5.2f %5.2f %5.2f %6.3f %6.3f %6.3f %6.3f %5.2f %5.2f%s\n",
+        label, e->depth_corr, e->depth_rms, e->hp_corr, e->hp_rms, e->nose_rec, e->nose_true, e->scale_ratio, e->yaw_rms,
+        e->pitch_rms, e->roll_rms, c->sh.rms, e->track_pop, e->track_pers, n ? sdm / n : NAN, e->zscore_rms,
+        e->zscore_floor_rms, c->sh.degenerate ? "  [degenerate: prior scale]" : "");
 }
 
 static int run_synth_mode(const plx_args *a) {
-    synth_env se = {.out = plx_arg_str(a, "out", "runs/main/fuse/synth")};
+    synth_env se = {.out = plx_arg_str(a, "out", "runs/main/fuse/synth"), .write_clip = plx_arg_str(a, "write-clip", NULL)};
     context cx;
     load_context(a, &cx);
     se.cx = &cx;
@@ -963,13 +1111,16 @@ static int run_synth_mode(const plx_args *a) {
     say("columns: depth corr / rms (px) over the core after similarity alignment to truth; the same for the\n"
         "high-pass part (best quadratic removed: nose, eyes, lips); nose protrusion recovered / true (px);\n"
         "depth scale (regression of recovered on true depth); pose rms (deg, truth frame); rigid reprojection rms;\n"
-        "track error vs truth for population / personal tracks (px); rms z-score of the depth error\n\n");
+        "track error vs truth for population / personal tracks (px); mean bootstrap sd of z (px); rms z-score of\n"
+        "the depth error with the bootstrap sd alone and with the systematic floor (%.1f px) added\n\n", SD_FLOOR_PX);
 
     /* base clip, with diagnostics */
     plx_fu_synth_opts o = plx_fu_synth_defaults();
     o.shade = plx_arg_num(a, "shade", o.shade);
     o.noise = plx_arg_num(a, "noise", o.noise);
     o.F = (int)plx_arg_int(a, "frames", o.F);
+    o.yaw_deg = plx_arg_num(a, "yaw", o.yaw_deg);
+    o.pitch_deg = plx_arg_num(a, "nod", o.pitch_deg);
     synth_eval ev;
     say("BASE: 40 frames, yaw +-30, nod +-12, roll +-3, 250 x 250, head 0, texture 0\n");
     eval_header();
@@ -1003,10 +1154,14 @@ static int run_synth_mode(const plx_args *a) {
         eval_line(lab, &ev, &c);
         free_clip(&c);
     }
-    say("\nDEGENERATE MOTION: yaw +-30 with nod amplitude varied, roll 0 (40 frames, head 0, texture 0);\n"
-        "metric-only scale = depth scale of the metric upgrade without the prior fallback\n");
-    say("  %-16s %8s %8s %8s %8s %8s %8s  %s\n", "nod", "spread2", "gap", "metric", "boot_sd", "final", "hpcorr",
-        "decision");
+    say("\nDEGENERATE MOTION, ORACLE TRACKS: true projections of head 0's lattice nodes + 0.2 px noise, 40 frames,\n"
+        "roll 0; depth scale of the METRIC solution alone (regression on truth, mean over 6 noise seeds), its\n"
+        "bootstrap sd, and the prior's weight in the fused scale (> 0.5 = flagged degenerate)\n");
+    oracle_sweep(&cx, &heads[0]);
+
+    say("\nDEGENERATE MOTION, FULL PIPELINE: yaw +-30 with nod amplitude varied, roll 0 (40 frames, head 0, texture 0)\n");
+    say("  %-12s %8s %8s %8s %8s %8s %8s %8s  %s\n", "nod", "spread2", "gap", "metric", "boot_sd", "prior_w", "final",
+        "hpcorr", "decision");
     double nods[6] = {0, 1, 2, 4, 8, 12};
     for (int k = 0; k < 6; k++) {
         o = plx_fu_synth_defaults();
@@ -1015,6 +1170,7 @@ static int run_synth_mode(const plx_args *a) {
         /* the same tracks through the metric upgrade alone */
         plx_fu_factor_opts fo = cx.fopt;
         fo.prior_scale = 0;
+        fo.boot = 0;
         plx_fu_tracks tp = tracks_of(&c, c.x);
         plx_fu_shape sm;
         plx_fu_factorise(&tp, &fo, &sm);
@@ -1022,17 +1178,19 @@ static int run_synth_mode(const plx_args *a) {
         double *XY = PLX_NEW(double, (size_t)2 * c.nd.P), *err = PLX_NEW(double, c.nd.P), Rq[9];
         true_correspondences(&heads[0], &o, &c, c.x, XY, err);
         eval_depth(&heads[0], &c.nd, &sm, XY, &em, Rq);
-        say("  nod +-%-10.0f %8.2f %8.1e %8.3f %8.3f %8.3f %8.3f  %s\n", nods[k], c.sh.spread_deg[1], c.sh.gap,
-            em.scale_ratio, sm.scale_sd, ev.scale_ratio, ev.hp_corr, c.sh.degenerate ? "degenerate -> prior scale" : "metric");
+        say("  nod +-%-6.0f %8.2f %8.1e %8.3f %8.3f %8.3f %8.3f %8.3f  %s\n", nods[k], c.sh.spread_deg[1], c.sh.gap,
+            em.scale_ratio, c.sh.scale_sd_metric, c.sh.prior_weight, ev.scale_ratio, ev.hp_corr,
+            c.sh.degenerate ? "degenerate: prior scale" : "metric");
         free(XY), free(err);
         plx_fu_shape_free(&sm);
         free_clip(&c);
     }
 
-    say("\nSHAPES x TEXTURES (40 frames, yaw +-30, nod +-12): high-pass depth correlation of the reconstruction\n"
-        "with each head's truth (rows: true head of the clip; columns: head compared against)\n");
+    say("\nSHAPES x TEXTURES (40 frames, yaw +-30, nod +-12). Does the reconstruction carry the PERSON-SPECIFIC\n"
+        "part? At each clip's true correspondences, m = mean of the three heads' true depths; the reconstruction\n"
+        "is aligned to (X, Y, m) and corr(z_rec - m, z_true_j - m) is averaged over the three textures\n"
+        "(rows: the clip's head; columns: the head j compared against)\n");
     double conf[3][3] = {{0}};
-    int ncf[3] = {0};
     for (int hd = 0; hd < 3; hd++)
         for (int tx = 0; tx < 3; tx++) {
             o = plx_fu_synth_defaults();
@@ -1042,43 +1200,26 @@ static int run_synth_mode(const plx_args *a) {
             snprintf(lab, sizeof lab, "head %d texture %d", hd, tx);
             if (hd == 0 && tx == 0) eval_header();
             eval_line(lab, &ev, &c);
-            double *XY = PLX_NEW(double, (size_t)2 * c.nd.P), *err = PLX_NEW(double, c.nd.P), Rq[9];
+            double *XY = PLX_NEW(double, (size_t)2 * c.nd.P), *err = PLX_NEW(double, c.nd.P);
             true_correspondences(&heads[hd], &o, &c, c.x, XY, err);
-            for (int j = 0; j < 3; j++) {
-                synth_eval ej;
-                eval_depth(&heads[j], &c.nd, &c.sh, XY, &ej, Rq);
-                conf[hd][j] += ej.hp_corr / 3;
-            }
-            ncf[hd]++;
+            for (int j = 0; j < 3; j++) conf[hd][j] += deviation_corr(heads, 3, j, &c.nd, &c.sh, XY) / 3;
             free(XY), free(err);
             free_clip(&c);
         }
     say("  %-8s %8s %8s %8s\n", "", "head 0", "head 1", "head 2");
     for (int hd = 0; hd < 3; hd++) say("  head %d   %8.3f %8.3f %8.3f\n", hd, conf[hd][0], conf[hd][1], conf[hd][2]);
     {
-        /* the truths themselves: how different are the three heads' high-pass depth patterns? */
         nodes nd;
         plx_lattice L = plx_lattice_make(cx.topt.step);
         nodes_make(&cx, &L, &nd);
-        double *z[3], *hp[3], *w = PLX_NEW(double, nd.P);
+        say("  true noses (protrusion at the lattice nodes):");
         for (int j = 0; j < 3; j++) {
-            z[j] = PLX_NEW(double, nd.P), hp[j] = PLX_NEW(double, nd.P);
-            for (int n = 0; n < nd.P; n++) z[j][n] = plx_fu_head_depth(&heads[j], nd.X0[n], nd.Y0[n]);
+            double *z = PLX_NEW(double, nd.P);
+            for (int n = 0; n < nd.P; n++) z[n] = plx_fu_head_depth(&heads[j], nd.X0[n], nd.Y0[n]);
+            say(" head %d %.1f px", j, protrusion(&nd, z));
+            free(z);
         }
-        for (int n = 0; n < nd.P; n++) w[n] = nd.core[n];
-        for (int j = 0; j < 3; j++) highpass(nd.P, nd.X0, nd.Y0, z[j], w, hp[j]);
-        say("  truth vs truth (same measure, canonical nodes):\n");
-        for (int i = 0; i < 3; i++) {
-            say("  head %d  ", i);
-            for (int j = 0; j < 3; j++) {
-                double cr;
-                compare(nd.P, hp[i], hp[j], w, &cr, NULL);
-                say(" %8.3f", cr);
-            }
-            say("   nose %.1f px\n", protrusion(&nd, z[i]));
-        }
-        for (int j = 0; j < 3; j++) free(z[j]), free(hp[j]);
-        free(w);
+        say("\n");
         nodes_free(&nd);
     }
 
@@ -1105,10 +1246,538 @@ done:
     return 0;
 }
 
+/* ---- LFW identities as multi-view sets ----------------------------------------------------------
+ * The photos of one person are treated as frames: different days, lighting, expressions and no
+ * temporal order, so this is much harder than video. The population fits already in <flow> are the
+ * tracks (personal re-tracking across days would be dominated by lighting), the factorisation is
+ * the clip's. Identity labels are used ONLY to group photos into sets and to score; nothing is
+ * fitted with them. */
+typedef struct {
+    plx_tensor u, sim, q, nw, rgb;
+    plx_lfw    db;
+    uint8_t   *trusted; /* [N] flow quality flags & 27 == 0 */
+} lfw_data;
+
+static void lfw_load(const context *cx, lfw_data *d) {
+    char path[4096];
+    memset(d, 0, sizeof *d);
+    snprintf(path, sizeof path, "%s/u.plxt", cx->flow);
+    if (plx_tensor_map(path, &d->u) != PLX_OK || d->u.dim[1] != 2 || d->u.dim[2] * d->u.dim[3] != 357) plx_die("cannot read %s", path);
+    snprintf(path, sizeof path, "%s/sim.plxt", cx->flow);
+    if (plx_tensor_load(path, &d->sim) != PLX_OK) plx_die("cannot read %s", path);
+    snprintf(path, sizeof path, "%s/quality.plxt", cx->flow);
+    if (plx_tensor_load(path, &d->q) != PLX_OK) plx_die("cannot read %s", path);
+    snprintf(path, sizeof path, "%s/node_weight.plxt", cx->flow);
+    if (plx_tensor_load(path, &d->nw) != PLX_OK || plx_tensor_count(&d->nw) != 357) plx_die("cannot read %s", path);
+    snprintf(path, sizeof path, "%s/rgb.plxt", cx->pack);
+    if (plx_tensor_map(path, &d->rgb) != PLX_OK) plx_die("cannot read %s", path);
+    if (plx_lfw_open(&d->db, cx->lfw) != PLX_OK || d->db.n_images != d->u.dim[0])
+        plx_die("LFW index at %s does not match the flow (%lld images)", cx->lfw, (long long)d->u.dim[0]);
+    int N = d->db.n_images, Q = (int)d->q.dim[1];
+    d->trusted = PLX_NEW(uint8_t, N);
+    for (int i = 0; i < N; i++) d->trusted[i] = ((int)((float *)d->q.data)[(size_t)i * Q + 6] & 27) == 0;
+}
+
+static void lfw_free(lfw_data *d) {
+    plx_tensor_free(&d->u), plx_tensor_free(&d->sim), plx_tensor_free(&d->q), plx_tensor_free(&d->nw);
+    plx_tensor_free(&d->rgb);
+    plx_lfw_free(&d->db);
+    free(d->trusted);
+}
+
+static plx_sim lfw_sim(const lfw_data *d, int i) {
+    const float *s = (const float *)d->sim.data + (size_t)i * 4;
+    return (plx_sim){s[0], s[1], s[2], s[3]};
+}
+
+/* Tracks of a set of photos: x_i(n) = T_i(p_n + u_i(p_n)) in each photo's own crop (weak
+ * perspective per photo: the factorisation's per-frame scale and translation absorb the crops).
+ * Base weight: tracked region x sqrt of the population node reliability (floored). */
+static void lfw_tracks(const lfw_data *d, const nodes *nd, const int *idx, int F, double *x, double *w) {
+    int P = nd->P;
+    const float *nw = d->nw.data;
+    for (int f = 0; f < F; f++) {
+        const float *u = (const float *)d->u.data + (size_t)idx[f] * 714;
+        plx_sim T = lfw_sim(d, idx[f]);
+        for (int n = 0; n < P; n++) {
+            double px = plx_lat_x(&nd->L, n % nd->L.nx), py = plx_lat_y(&nd->L, n / nd->L.nx), ix, iy;
+            plx_sim_apply(T, px + u[n], py + u[P + n], &ix, &iy);
+            x[((size_t)f * 2) * P + n] = ix, x[((size_t)f * 2 + 1) * P + n] = iy;
+            w[(size_t)f * P + n] = nd->track[n] ? sqrt(fmax(nw[n], 0.01)) : 0;
+        }
+    }
+}
+
+static int lfw_factor(const lfw_data *d, const nodes *nd, const int *idx, int F, const plx_fu_factor_opts *o,
+                      plx_fu_shape *sh) {
+    double *x = PLX_NEW(double, (size_t)F * 2 * nd->P), *w = PLX_NEW(double, (size_t)F * nd->P);
+    lfw_tracks(d, nd, idx, F, x, w);
+    plx_fu_tracks tr = {.F = F, .P = nd->P, .nx = nd->L.nx, .ny = nd->L.ny, .img_w = 250, .img_h = 250, .x = x, .w = w,
+                        .X0 = nd->X0, .Y0 = nd->Y0, .zp = nd->zp, .gw = nd->gw};
+    int st = plx_fu_factorise(&tr, o, sh);
+    free(x), free(w);
+    return st;
+}
+
+/* Trusted photos of identity id (global indices), at most cap. */
+static int lfw_photos(const lfw_data *d, int id, int *out, int cap) {
+    int n = 0;
+    for (int i = d->db.id_first[id]; i < d->db.id_first[id + 1] && n < cap; i++)
+        if (d->trusted[i]) out[n++] = i;
+    return n;
+}
+
+/* Fused texture of a photo set through the population fits (the clip's fusion, frames = photos). */
+static void lfw_texture(const lfw_data *d, const nodes *nd, const int *idx, int F, const plx_fu_shape *sh, const double *dense,
+                        plx_img *tex, plx_img *wt) {
+    plx_img *frames = PLX_NEW(plx_img, F);
+    plx_fu_track tr = {.F = F, .lat = nd->L, .T = PLX_NEW(plx_sim, F), .u = PLX_NEW(float, (size_t)F * 714)};
+    for (int f = 0; f < F; f++) {
+        frames[f] = plx_img_from_u8((const uint8_t *)d->rgb.data + (size_t)idx[f] * 250 * 250 * 3, 250, 250, 3, 1.0f / 255);
+        tr.T[f] = lfw_sim(d, idx[f]);
+        memcpy(tr.u + (size_t)f * 714, (const float *)d->u.data + (size_t)idx[f] * 714, sizeof(float) * 714);
+    }
+    plx_fu_fuse_texture(frames, F, &tr, sh, dense, tex, wt);
+    for (int f = 0; f < F; f++) plx_img_free(&frames[f]);
+    free(frames), free(tr.T), free(tr.u);
+}
+
+/* Depth residual over the core nodes estimated in both: z - mean (mode 0), or additionally with
+ * the mean pattern's own direction and the plane {1, Y0} projected out (mode 1: the part of
+ * personal depth a single photo's bas-relief gauge never sees, DESIGN §5.5). */
+static void residual_vec(const nodes *nd, const double *z, const double *mean, int mode, double *r) {
+    int P = nd->P;
+    double basis[3][17 * 21];
+    for (int n = 0; n < P; n++) basis[0][n] = 1, basis[1][n] = nd->Y0[n], basis[2][n] = mean[n];
+    for (int n = 0; n < P; n++) r[n] = nd->core[n] && isfinite(z[n]) ? z[n] - mean[n] : NAN;
+    if (mode == 0) return;
+    /* Gram-Schmidt of the basis over the core, then projection */
+    for (int k = 0; k < 3; k++) {
+        for (int j = 0; j < k; j++) {
+            double dp = 0;
+            for (int n = 0; n < P; n++)
+                if (isfinite(r[n])) dp += basis[k][n] * basis[j][n];
+            for (int n = 0; n < P; n++) basis[k][n] -= dp * basis[j][n];
+        }
+        double nn = 0;
+        for (int n = 0; n < P; n++)
+            if (isfinite(r[n])) nn += basis[k][n] * basis[k][n];
+        for (int n = 0; n < P; n++) basis[k][n] /= sqrt(nn);
+        double dp = 0;
+        for (int n = 0; n < P; n++)
+            if (isfinite(r[n])) dp += r[n] * basis[k][n];
+        for (int n = 0; n < P; n++)
+            if (isfinite(r[n])) r[n] -= dp * basis[k][n];
+    }
+}
+
+static double vec_corr(int P, const double *a, const double *b) {
+    double w[17 * 21];
+    for (int n = 0; n < P; n++) w[n] = isfinite(a[n]) && isfinite(b[n]);
+    double c;
+    compare(P, a, b, w, &c, NULL);
+    return c;
+}
+
+typedef struct {
+    const lfw_data *d;
+    const nodes *nd;
+    const plx_fu_factor_opts *o;
+    int *sets;       /* [n][F] photo indices */
+    int F;
+    double *z;       /* [n][P] depth (NaN unused) */
+    double *ab;      /* [n][2P] in-plane shape a, b */
+    uint8_t *ok, *degen;
+    double *spread2, *rms;
+} half_ctx;
+
+static void half_one(int64_t k, int tid, void *pc) {
+    (void)tid;
+    half_ctx *c = pc;
+    int P = c->nd->P;
+    plx_fu_shape sh;
+    c->ok[k] = lfw_factor(c->d, c->nd, c->sets + (size_t)k * c->F, c->F, c->o, &sh) == PLX_OK;
+    if (!c->ok[k]) return;
+    for (int n = 0; n < P; n++) {
+        c->z[(size_t)k * P + n] = sh.S[2 * P + n];
+        c->ab[(size_t)k * 2 * P + n] = sh.S[n] - c->nd->X0[n];
+        c->ab[(size_t)k * 2 * P + P + n] = sh.S[P + n] - c->nd->Y0[n];
+    }
+    c->degen[k] = sh.degenerate;
+    c->spread2[k] = sh.spread_deg[1];
+    c->rms[k] = sh.rms;
+    plx_fu_shape_free(&sh);
+}
+
+static int run_lfw_mode(const plx_args *a) {
+    const char *out = plx_arg_str(a, "out", "runs/main/fuse/lfw");
+    context cx;
+    load_context(a, &cx);
+    open_summary(out);
+    lfw_data d;
+    lfw_load(&cx, &d);
+    int min_photos = (int)plx_arg_int(a, "min-photos", 20), reps = (int)plx_arg_int(a, "reps", 5);
+    plx_lattice L8 = plx_lattice_make(PLX_FL_STEP);
+    nodes nd;
+    nodes_make(&cx, &L8, &nd);
+    int P = nd.P, nid = 0, *ids = PLX_NEW(int, d.db.n_ids), *cnt = PLX_NEW(int, d.db.n_ids), *buf = PLX_NEW(int, 1024);
+    for (int id = 0; id < d.db.n_ids; id++) {
+        int n = lfw_photos(&d, id, buf, 1024);
+        if (n >= min_photos) ids[nid] = id, cnt[nid++] = n;
+    }
+    int ntrack = 0;
+    for (int n = 0; n < P; n++) ntrack += nd.track[n];
+    say("plx_fuse --lfw-identity: %d identities with >= %d trusted photos (flow quality flags & 27 == 0)\n"
+        "tracks = population fits (flow u, sim); 8-px lattice, %d tracked nodes; identity labels used only to group\n"
+        "photos into sets and to score\n\n", nid, min_photos, ntrack);
+
+    /* 1. one reconstruction per identity from all its trusted photos (at most 200) */
+    plx_fu_factor_opts fo = cx.fopt;
+    fo.boot = (int)plx_arg_int(a, "boot", 20);
+    double *zall = PLX_NEW(double, (size_t)nid * P), *sdall = PLX_NEW(double, (size_t)nid * P);
+    say("FULL SETS (at most 200 photos each)\n  %-26s %5s %8s %8s %7s %7s %7s %7s %7s %9s\n", "identity", "F", "spread1",
+        "spread2", "reproj", "nose", "corr_zb", "msd", "prior_w", "decision");
+    int ndeg = 0;
+    for (int k = 0; k < nid; k++) {
+        int F = lfw_photos(&d, ids[k], buf, 200);
+        plx_fu_shape sh;
+        int st = lfw_factor(&d, &nd, buf, F, &fo, &sh);
+        if (st != PLX_OK) {
+            for (int n = 0; n < P; n++) zall[(size_t)k * P + n] = sdall[(size_t)k * P + n] = NAN;
+            say("  %-26s %5d factorisation failed (%s: the metric constraints admit no positive L)\n",
+                d.db.id_name[ids[k]], F, plx_la_status_str(st));
+            continue;
+        }
+        for (int n = 0; n < P; n++) zall[(size_t)k * P + n] = sh.S[2 * P + n], sdall[(size_t)k * P + n] = sh.sd[2 * P + n];
+        double cz;
+        compare(P, sh.S + 2 * P, nd.zp, nd.gw, &cz, NULL);
+        say("  %-26s %5d %8.2f %8.2f %7.3f %7.2f %7.3f %7.3f %7.3f %9s\n", d.db.id_name[ids[k]], F, sh.spread_deg[0],
+            sh.spread_deg[1], sh.rms, protrusion(&nd, sh.S + 2 * P), cz, sh.scale_sd_metric, sh.prior_weight,
+            sh.degenerate ? "prior" : "metric");
+        ndeg += sh.degenerate;
+        plx_fu_shape_free(&sh);
+    }
+    say("  bas-relief fallback (prior depth scale) in %d of %d identities\n", ndeg, nid);
+    {
+        int64_t dim[3] = {nid, 21, 17};
+        float *zf = PLX_NEW(float, (size_t)nid * P);
+        for (size_t k = 0; k < (size_t)nid * P; k++) zf[k] = (float)zall[k];
+        char path[4096];
+        snprintf(path, sizeof path, "%s/depth.plxt", out);
+        plx_tensor_save(path, PLX_F32, 3, dim, zf);
+        for (size_t k = 0; k < (size_t)nid * P; k++) zf[k] = (float)sdall[k];
+        snprintf(path, sizeof path, "%s/depth_sd.plxt", out);
+        plx_tensor_save(path, PLX_F32, 3, dim, zf);
+        free(zf);
+        snprintf(path, sizeof path, "%s/identities.txt", out);
+        FILE *f = fopen(path, "w");
+        for (int k = 0; f && k < nid; k++) fprintf(f, "%d %s %d\n", k, d.db.id_name[ids[k]], cnt[k]);
+        if (f) fclose(f);
+    }
+
+    /* 2. split halves: reliability (same person, two disjoint photo sets) vs discriminability */
+    say("\nSPLIT HALVES: each identity's trusted photos shuffled, two disjoint halves of n photos each, reconstructed\n"
+        "independently; scores = correlation of the depth residuals over the core nodes. Residual A: z minus the mean\n"
+        "of all half reconstructions of that condition; residual B: additionally the mean pattern's direction and the\n"
+        "plane {1, Y0} projected out. Same = (A_i, B_i), different = (A_i, B_j), i != j. %d random splits per n.\n", reps);
+    say("  %5s %5s %8s %8s %8s %8s %8s %8s %8s %7s %7s %6s\n", "n", "ids", "AUC_A", "AUC_B", "AUC_ab", "same_A", "diff_A",
+        "same_B", "diff_B", "degen", "reproj", "failed");
+    int halves[6] = {3, 5, 10, 15, 20, 30};
+    plx_fu_factor_opts fh = cx.fopt;
+    fh.boot = 0;
+    plx_rng rng;
+    plx_rng_seed(&rng, 0x1f3);
+    for (int hi = 0; hi < 6; hi++) {
+        int n = halves[hi], m = 0, *sel = PLX_NEW(int, nid);
+        for (int k = 0; k < nid; k++)
+            if (cnt[k] >= 2 * n) sel[m++] = k;
+        if (m < 4) {
+            free(sel);
+            continue;
+        }
+        double auc[3] = {0}, sm[2] = {0}, dm[2] = {0}, deg = 0, rr = 0;
+        int nsm = 0, ndm = 0, nfail = 0;
+        for (int rep = 0; rep < reps; rep++) {
+            half_ctx hc = {.d = &d, .nd = &nd, .o = &fh, .F = n, .sets = PLX_NEW(int, (size_t)2 * m * n),
+                           .z = PLX_NEW(double, (size_t)2 * m * P), .ab = PLX_NEW(double, (size_t)4 * m * P),
+                           .ok = PLX_NEW(uint8_t, 2 * m), .degen = PLX_NEW(uint8_t, 2 * m),
+                           .spread2 = PLX_NEW(double, 2 * m), .rms = PLX_NEW(double, 2 * m)};
+            for (int s = 0; s < m; s++) {
+                int c0 = lfw_photos(&d, ids[sel[s]], buf, 1024);
+                plx_rng_shuffle(&rng, buf, c0);
+                memcpy(hc.sets + (size_t)(2 * s) * n, buf, sizeof(int) * n);
+                memcpy(hc.sets + (size_t)(2 * s + 1) * n, buf + n, sizeof(int) * n);
+            }
+            plx_parallel_for(2 * m, 1, half_one, &hc);
+            /* means over all half reconstructions (depth, in-plane shape) */
+            double *mz = PLX_NEW(double, P), *mab = PLX_NEW(double, 2 * P);
+            int nok = 0;
+            for (int k = 0; k < 2 * m; k++) {
+                if (!hc.ok[k]) continue;
+                nok++;
+                for (int q = 0; q < P; q++) mz[q] += isfinite(hc.z[(size_t)k * P + q]) ? hc.z[(size_t)k * P + q] : 0;
+                for (int q = 0; q < 2 * P; q++) mab[q] += isfinite(hc.ab[(size_t)k * 2 * P + q]) ? hc.ab[(size_t)k * 2 * P + q] : 0;
+                deg += hc.degen[k], rr += hc.rms[k];
+            }
+            for (int q = 0; q < P; q++) mz[q] /= nok;
+            for (int q = 0; q < 2 * P; q++) mab[q] /= nok;
+            double *R[2], *AB = PLX_NEW(double, (size_t)2 * m * 2 * P);
+            for (int md = 0; md < 2; md++) {
+                R[md] = PLX_NEW(double, (size_t)2 * m * P);
+                for (int k = 0; k < 2 * m; k++) residual_vec(&nd, hc.z + (size_t)k * P, mz, md, R[md] + (size_t)k * P);
+            }
+            for (int k = 0; k < 2 * m; k++)
+                for (int q = 0; q < 2 * P; q++)
+                    AB[(size_t)k * 2 * P + q] = nd.core[q % P] ? hc.ab[(size_t)k * 2 * P + q] - mab[q] : NAN;
+            int np = m * m;
+            double *sc[3];
+            int *same = PLX_NEW(int, np);
+            for (int t = 0; t < 3; t++) sc[t] = PLX_NEW(double, np);
+            for (int i = 0; i < m; i++)
+                for (int j = 0; j < m; j++) {
+                    int pi = i * m + j;
+                    same[pi] = i == j;
+                    bool ok = hc.ok[2 * i] && hc.ok[2 * j + 1];
+                    for (int md = 0; md < 2; md++)
+                        sc[md][pi] = ok ? vec_corr(P, R[md] + (size_t)(2 * i) * P, R[md] + (size_t)(2 * j + 1) * P) : NAN;
+                    sc[2][pi] = ok ? vec_corr(2 * P, AB + (size_t)(2 * i) * 2 * P, AB + (size_t)(2 * j + 1) * 2 * P) : NAN;
+                    if (!ok) continue;
+                    for (int md = 0; md < 2; md++) {
+                        if (i == j) sm[md] += sc[md][pi];
+                        else dm[md] += sc[md][pi];
+                    }
+                    if (i == j) nsm++;
+                    else ndm++;
+                }
+            for (int k = 0; k < 2 * m; k++) nfail += !hc.ok[k];
+            for (int t = 0; t < 3; t++) auc[t] += plx_verif_auc(sc[t], same, np) / reps;
+            for (int t = 0; t < 3; t++) free(sc[t]);
+            free(same), free(R[0]), free(R[1]), free(AB), free(mz), free(mab);
+            free(hc.sets), free(hc.z), free(hc.ab), free(hc.ok), free(hc.degen), free(hc.spread2), free(hc.rms);
+        }
+        int nok_all = 2 * m * reps - nfail;
+        say("  %5d %5d %8.3f %8.3f %8.3f %8.3f %8.3f %8.3f %8.3f %7.2f %7.3f %6d\n", n, m, auc[0], auc[1], auc[2],
+            sm[0] / nsm, dm[0] / ndm, sm[1] / nsm, dm[1] / ndm, deg / nok_all, rr / nok_all, nfail);
+        free(sel);
+    }
+    say("  (AUC_ab: the same test on the in-plane shape a, b from the same factorisations, for comparison)\n");
+
+    /* 3. a few personal heads next to the population mean */
+    {
+        int show = PLX_MIN(nid, 4), order[4] = {0}, used_n = 0;
+        for (int s = 0; s < show; s++) { /* the identities with the most photos */
+            int best = -1;
+            for (int k = 0; k < nid; k++) {
+                bool taken = false;
+                for (int j = 0; j < used_n; j++) taken |= order[j] == k;
+                if (!taken && (best < 0 || cnt[k] > cnt[best])) best = k;
+            }
+            order[used_n++] = best;
+        }
+        plx_img rows[5];
+        const char *titles[5];
+        char tbuf[5][160];
+        plx_pose poses[4] = {{-35 * DEG, 0, 0}, {0, 0, 0}, {35 * DEG, 0, 0}, {0, 20 * DEG, 0}};
+        /* population mean: z̄ with the mean warped face */
+        {
+            double *S = PLX_NEW(double, (size_t)3 * P), *dense = PLX_NEW(double, (size_t)3 * PLX_CANON_W * PLX_CANON_H);
+            uint8_t *u = PLX_NEW(uint8_t, P);
+            for (int n = 0; n < P; n++) S[n] = nd.X0[n], S[P + n] = nd.Y0[n], S[2 * P + n] = nd.zp[n], u[n] = nd.track[n];
+            plx_fu_dense_surface(&nd.L, S, u, true, dense);
+            plx_img z = plx_img_new(PLX_CANON_W, PLX_CANON_H, 1), tex = {0};
+            for (int q = 0; q < PLX_CANON_W * PLX_CANON_H; q++) z.px[q] = (float)dense[2 * PLX_CANON_W * PLX_CANON_H + q];
+            char path[4096];
+            snprintf(path, sizeof path, "%s/mean_face.plxt", cx.flow);
+            plx_tensor t;
+            if (plx_tensor_load(path, &t) == PLX_OK) {
+                tex = plx_img_new(PLX_CANON_W, PLX_CANON_H, 1);
+                memcpy(tex.px, t.data, sizeof(float) * PLX_CANON_W * PLX_CANON_H);
+                plx_tensor_free(&t);
+            }
+            rows[0] = plx_render_views(&z, NULL, tex.px ? &tex : NULL, poses, 4);
+            titles[0] = "population mean depth (zbar) with the population mean face";
+            plx_img_free(&z), plx_img_free(&tex);
+            free(S), free(dense), free(u);
+        }
+        for (int s = 0; s < show; s++) {
+            int k = order[s], F = lfw_photos(&d, ids[k], buf, 60);
+            plx_fu_shape sh;
+            if (lfw_factor(&d, &nd, buf, F, &fh, &sh) != PLX_OK) continue;
+            double *dense = PLX_NEW(double, (size_t)3 * PLX_CANON_W * PLX_CANON_H);
+            plx_fu_dense_surface(&nd.L, sh.S, sh.used, true, dense);
+            plx_img tex, wt, z = plx_img_new(PLX_CANON_W, PLX_CANON_H, 1);
+            lfw_texture(&d, &nd, buf, F, &sh, dense, &tex, &wt);
+            for (int q = 0; q < PLX_CANON_W * PLX_CANON_H; q++) z.px[q] = (float)dense[2 * PLX_CANON_W * PLX_CANON_H + q];
+            for (size_t q = 0; q < (size_t)tex.w * tex.h * tex.c; q++) tex.px[q] = PLX_CLAMP(tex.px[q], 0.0f, 1.0f);
+            rows[1 + s] = plx_render_views(&z, NULL, &tex, poses, 4);
+            snprintf(tbuf[s], sizeof tbuf[s], "%s: %d photos, nose %.1f px (zbar %.1f), %s depth scale", d.db.id_name[ids[k]], F,
+                     protrusion(&nd, sh.S + 2 * P), protrusion(&nd, nd.zp), sh.degenerate ? "prior" : "metric");
+            titles[1 + s] = tbuf[s];
+            plx_img_free(&tex), plx_img_free(&wt), plx_img_free(&z);
+            free(dense);
+            plx_fu_shape_free(&sh);
+        }
+        plx_img all = vstack(rows, titles, 1 + show);
+        save_png(out, "heads.png", &all);
+        plx_img_free(&all);
+        for (int s = 0; s <= show; s++) plx_img_free(&rows[s]);
+    }
+    /* 4. depth residual maps of every identity (full sets) */
+    {
+        double *mz = PLX_NEW(double, P);
+        int nok = 0;
+        for (int k = 0; k < nid; k++)
+            if (isfinite(zall[(size_t)k * P + P / 2])) {
+                nok++;
+                for (int n = 0; n < P; n++) mz[n] += isfinite(zall[(size_t)k * P + n]) ? zall[(size_t)k * P + n] : 0;
+            }
+        for (int n = 0; n < P; n++) mz[n] /= PLX_MAX(nok, 1);
+        int show = PLX_MIN(nid, 40);
+        plx_img *tiles = PLX_NEW(plx_img, show);
+        char **labels = PLX_NEW(char *, show);
+        uint8_t *u = PLX_NEW(uint8_t, P);
+        for (int k = 0; k < show; k++) {
+            double r[17 * 21];
+            for (int n = 0; n < P; n++) r[n] = zall[(size_t)k * P + n] - mz[n], u[n] = nd.core[n] && isfinite(r[n]);
+            plx_img im = node_image(&nd, r, u);
+            tiles[k] = plx_viz_colormap(im.px, im.w, im.h, -4, 4, PLX_CMAP_DIV);
+            plx_img_free(&im);
+            labels[k] = plx_strdup(d.db.id_name[ids[k]]);
+            if (strlen(labels[k]) > 20) labels[k][20] = 0;
+        }
+        plx_montage_opts mo = plx_montage_defaults();
+        mo.cols = 10;
+        plx_img mon = plx_viz_montage(tiles, show, (const char *const *)labels, &mo);
+        save_png(out, "depth_residuals.png", &mon);
+        plx_img_free(&mon);
+        for (int k = 0; k < show; k++) plx_img_free(&tiles[k]), free(labels[k]);
+        free(tiles), free(labels), free(u), free(mz);
+        say("depth_residuals.png: z minus the mean over identities, core nodes, colour range +-4 px\n");
+    }
+    say("outputs in %s\n", out);
+    nodes_free(&nd);
+    free(ids), free(cnt), free(buf), free(zall), free(sdall);
+    lfw_free(&d);
+    free_context(&cx);
+    fclose(g_sum);
+    return 0;
+}
+
+/* ---- localisation on pasted LFW photos ---------------------------------------------------------- */
+typedef struct {
+    plx_img frame;
+    plx_sim T_true;
+} pasted;
+
+/* An LFW photo (gray) pasted with scale g at offset o into a cluttered background, inside a soft
+ * ellipse around its face; truth = the photo's congealing similarity carried along. */
+static pasted paste_face(const plx_img *photo, plx_sim T_photo, int W, int H, uint64_t seed) {
+    plx_rng r;
+    plx_rng_seed(&r, seed);
+    plx_fu_synth_opts so = plx_fu_synth_defaults();
+    so.frame_w = W, so.frame_h = H, so.clutter = true, so.seed = seed;
+    pasted p = {.frame = plx_fu_synth_background(&so, 1)};
+    double g = 0.6 * pow(2.0 / 0.6, plx_rng_uniform(&r)), fcx, fcy;
+    plx_sim_apply(T_photo, PLX_CANON_CX, PLX_CANON_CY, &fcx, &fcy);
+    /* face centre lands uniformly inside the frame, a face-height from its border */
+    double mx = 70 * g, my = 90 * g;
+    double cx = mx + plx_rng_uniform(&r) * fmax(W - 2 * mx, 1), cy = my + plx_rng_uniform(&r) * fmax(H - 2 * my, 1);
+    double ox = cx - g * fcx, oy = cy - g * fcy;
+    plx_img src = plx_img_clone(photo);
+    if (g < 1) plx_blur(&src, &src, (float)(0.5 * sqrt(1 / (g * g) - 1)));
+    for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++) {
+            double qx = (x - ox) / g, qy = (y - oy) / g, ex = (qx - fcx) / 75, ey = (qy - fcy) / 95, e = sqrt(ex * ex + ey * ey);
+            double al = PLX_CLAMP((1.15 - e) / 0.15, 0.0, 1.0);
+            if (al <= 0 || qx < 0 || qy < 0 || qx > 249 || qy > 249) continue;
+            float v = plx_sample1(&src, 0, PLX_INTERP_BILINEAR, (float)qx, (float)qy);
+            PLX_PX(&p.frame, x, y, 0) = (float)((1 - al) * PLX_PX(&p.frame, x, y, 0) + al * v);
+        }
+    plx_img_free(&src);
+    p.T_true = (plx_sim){g * T_photo.a, g * T_photo.b, 0, 0};
+    p.T_true.tx = g * (PLX_CANON_IMG_CX + T_photo.tx) + ox - PLX_CANON_IMG_CX;
+    p.T_true.ty = g * (PLX_CANON_IMG_CY + T_photo.ty) + oy - PLX_CANON_IMG_CY;
+    return p;
+}
+
+static int run_locate_mode(const plx_args *a) {
+    const char *out = plx_arg_str(a, "out", "runs/main/fuse/locate");
+    context cx;
+    load_context(a, &cx);
+    open_summary(out);
+    lfw_data d;
+    lfw_load(&cx, &d);
+    char path[4096];
+    plx_tensor gray;
+    snprintf(path, sizeof path, "%s/gray.plxt", cx.pack);
+    if (plx_tensor_map(path, &gray) != PLX_OK) plx_die("cannot read %s", path);
+    int n = (int)plx_arg_int(a, "n", 60), W = (int)plx_arg_int(a, "w", 480), H = (int)plx_arg_int(a, "h", 360);
+    plx_rng r;
+    plx_rng_seed(&r, 0x10c);
+    say("plx_fuse --locate-test: %d trusted LFW photos pasted at random scale (0.6 .. 2.0) and position into %d x %d\n"
+        "cluttered frames; truth = each photo's congealing similarity carried through the paste\n", n, W, H);
+    say("  %4s %6s %7s %8s %8s %7s %7s %6s\n", "#", "img", "scale", "err_px", "err_rel", "s_ratio", "score", "ok");
+    double *rel = PLX_NEW(double, n), *lsr = PLX_NEW(double, n), sec = 0;
+    int ok = 0;
+    plx_img *show = PLX_NEW(plx_img, 8);
+    plx_fu_locate_opts lo = plx_fu_locate_defaults();
+    for (int k = 0; k < n; k++) {
+        int i;
+        do i = (int)plx_rng_below(&r, (uint32_t)d.db.n_images);
+        while (!d.trusted[i]);
+        plx_img photo = plx_img_from_u8((const uint8_t *)gray.data + (size_t)i * 250 * 250, 250, 250, 1, 1.0f / 255);
+        pasted p = paste_face(&photo, lfw_sim(&d, i), W, H, 1000 + k);
+        double t0 = plx_now();
+        plx_fu_located L = plx_fu_locate(&cx.loc, &p.frame, &lo);
+        sec += plx_now() - t0;
+        double ex, ey, tx, ty;
+        plx_sim_apply(L.T, PLX_CANON_CX, PLX_CANON_CY, &ex, &ey);
+        plx_sim_apply(p.T_true, PLX_CANON_CX, PLX_CANON_CY, &tx, &ty);
+        double gs = plx_sim_scale(p.T_true), err = hypot(ex - tx, ey - ty);
+        rel[k] = err / (100 * gs);
+        lsr[k] = plx_sim_scale(L.T) / gs;
+        bool good = rel[k] < 0.1 && fabs(log(lsr[k])) < 0.1;
+        ok += good;
+        say("  %4d %6d %7.3f %8.2f %8.3f %7.3f %7.3f %6s\n", k, i, gs, err, rel[k], lsr[k], L.score, good ? "yes" : "NO");
+        if (k < 8) { /* the frame with truth (green) and estimate (red) face boxes */
+            show[k] = plx_viz_to_rgb(&p.frame);
+            const plx_sim Ts[2] = {p.T_true, L.T};
+            const float *col[2] = {GREEN, RED};
+            for (int t = 0; t < 2; t++) {
+                double cxy[4][2] = {{24, 21}, {104, 21}, {104, 136}, {24, 136}}, q[4][2];
+                for (int c = 0; c < 4; c++) plx_sim_apply(Ts[t], cxy[c][0], cxy[c][1], &q[c][0], &q[c][1]);
+                for (int c = 0; c < 4; c++)
+                    plx_draw_line(&show[k], (float)q[c][0], (float)q[c][1], (float)q[(c + 1) % 4][0], (float)q[(c + 1) % 4][1], 1.5f, col[t], 1);
+            }
+        }
+        plx_img_free(&photo), plx_img_free(&p.frame);
+    }
+    double rs[2] = {median_of(rel, n), 0};
+    for (int k = 0; k < n; k++) lsr[k] = fabs(log(lsr[k]));
+    rs[1] = median_of(lsr, n);
+    say("located %d of %d (centre error < 0.1 face, scale within 10%%); median relative centre error %.3f, median |log scale "
+        "ratio| %.3f; %.2f s per frame\n", ok, n, rs[0], rs[1], sec / n);
+    plx_montage_opts mo = plx_montage_defaults();
+    mo.cols = 4;
+    plx_img mon = plx_viz_montage(show, PLX_MIN(n, 8), NULL, &mo);
+    save_png(out, "located.png", &mon);
+    say("located.png: green = truth, red = located (canonical face-core box)\n");
+    plx_img_free(&mon);
+    for (int k = 0; k < PLX_MIN(n, 8); k++) plx_img_free(&show[k]);
+    free(show), free(rel), free(lsr);
+    plx_tensor_free(&gray);
+    lfw_free(&d);
+    free_context(&cx);
+    fclose(g_sum);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     plx_args a = {argc, argv};
     if (plx_arg_str(&a, "clip", NULL)) return run_clip_mode(&a);
     if (plx_arg_flag(&a, "synth")) return run_synth_mode(&a);
+    if (plx_arg_flag(&a, "lfw-identity")) return run_lfw_mode(&a);
+    if (plx_arg_flag(&a, "locate-test")) return run_locate_mode(&a);
     fprintf(stderr, "usage: plx_fuse --clip <clip.plxv | dir> --out <dir> | --synth | --lfw-identity | --locate-test\n");
     return 2;
 }

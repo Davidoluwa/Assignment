@@ -27,11 +27,17 @@
  *   - mirror: orthographic projection cannot tell a depth map from its reflection; the solution
  *     whose depth correlates positively with zp is kept, both correlations are reported;
  *   - bas-relief: the metric upgrade pins the depth scale only through second-order
- *     (foreshortening) effects; when the motion is (nearly) about one axis the depth scale is
- *     not separable from the rotation amplitude. Detected from the spread of rotation axes and
- *     from the conditioning of the metric constraint system; the depth scale is then set so the
- *     projection of the person's depth onto zp equals zp's own (the population value), and the
- *     record is flagged. */
+ *     (foreshortening, cos θ) effects, so small or single-axis motion leaves depth scale and
+ *     rotation amplitude nearly interchangeable. What matters is how well the scale is pinned,
+ *     and that is measured directly: a parametric bootstrap of the metric solution gives the
+ *     relative sd of its depth scale. The scale is then fused with the population prior (the
+ *     scale that makes the projection of the person's depth onto zp equal zp's own) by
+ *     precision, in log space, exactly as DESIGN §5.5 fuses everything else; the record is
+ *     flagged degenerate when the prior carries more weight than the motion. The spread of the
+ *     rotation axes and the conditioning (gap) of the metric constraint system are reported as
+ *     diagnostics. (A first version flagged degeneracy from a small second rotation axis; on
+ *     synthetic clips a pure ±30° yaw sweep pins the scale to 3 % with a bootstrap sd of 0.3 %,
+ *     so a single axis is not degenerate in itself: the amplitude is what counts.) */
 #ifndef PLX_FUSE_H
 #define PLX_FUSE_H
 
@@ -116,19 +122,21 @@ plx_fu_located plx_fu_locate(const plx_fu_locator *L, const plx_img *gray, const
 
 /* ---- tracking ----------------------------------------------------------------------------
  * Every frame f gets a full warp W_f(p) = T_f(p + u_f(p)) from Ω into the crop. Population pass:
- * plx_fl_fit_image from the previous frame's similarity. Personal pass, repeated `rounds` times:
- * (1) personal template = per-pixel mean (and variance) of the frames' orientation features
- * rendered through their current warps, at every pyramid level, NOT symmetrised (a person is
- * not exactly symmetric and their own asymmetries are good texture); (2) every frame is re-fitted
- * against it, warm-started from its current warp, on lattice `step` with bending weight
- * `lambda` (relative, flow.h) -- the population needs λ = 100 because it matches across
- * identities; frames of one face do not; (3) gauge: the frame-mean change of the canonical field
- * is removed (template and fits can otherwise drift together; the personal frame stays anchored
- * to the population fits' average). */
+ * plx_fl_fit_image from the previous frame's similarity. Personal pass: every frame is rendered
+ * ONCE through its population warp, and the personal increment is sampled on top of that render
+ * (track.c says why re-rendering is not an option); then, `rounds` times: (1) personal template =
+ * per-pixel mean (and variance) of the frames' sampled orientation features at every pyramid
+ * level, weighted by sample validity (and visibility, see plx_fu_track_retrack), NOT
+ * symmetrised (a person is not exactly symmetric and their own asymmetries are good texture);
+ * (2) every frame's increment is re-fitted against it, warm-started, on lattice `step` with
+ * bending weight `lambda` (relative, flow.h; the population needs λ = 100 because it matches
+ * across identities, frames of one face do not) and plain window weights; (3) gauge: the
+ * frame-mean increment is removed (template and fits could otherwise drift together; the
+ * personal frame stays anchored to the population fits' average). */
 typedef struct {
-    int   rounds;       /* personal template <-> re-fit iterations (default 3) */
-    int   step;         /* personal lattice: 8 or 4 (default 8) */
-    float lambda;       /* relative bending weight of the personal fit (default 3) */
+    int   rounds;       /* personal template <-> re-fit iterations (default 4) */
+    int   step;         /* personal lattice: 8 or 4 (default 8; 4 was not better on synthetic clips) */
+    float lambda;       /* relative bending weight of the personal fit (default 0.5) */
     int   iters;        /* Gauss-Newton iterations per personal stage (default 10) */
     bool  coarse;       /* also run a level-1 stage first (default true) */
 } plx_fu_track_opts;
@@ -142,9 +150,11 @@ typedef struct {
     plx_sim     *T;            /* [F] personal fit */
     float       *u;            /* [F][dof(lat)] */
     double      *cost_pop;     /* [F] population fit cost against the population template */
+    /* the next three are in units of the personal template's own across-frame variance, so a
+     * well-tracked clip sits near 1, and the population warps' value shows what re-tracking bought */
     double      *cost_pp;      /* [F] population warps measured against the FINAL personal template */
-    double      *cost;         /* [F] personal fit cost against the final personal template */
-    float       *node_cost;    /* [F][nodes] per-node normalised residual of the final fit (≈ K typical) */
+    double      *cost;         /* [F] personal warps against the final personal template */
+    float       *node_cost;    /* [F][nodes] per-node normalised residual of the final personal fit */
     float       *node_data;    /* [nodes] data share of the personal stiffness (flow.h data fraction) */
     double       drift[8];     /* per round: RMS of the removed frame-mean change, canonical px */
     plx_img      tmpl_gray;    /* Ω personal mean gray face (final round) */
@@ -156,6 +166,12 @@ typedef struct {
  * localisation). */
 void plx_fu_track_clip(const plx_fl_fitter *pop, const plx_img *grays, int F, plx_sim T0, const plx_fu_track_opts *o,
                        plx_fu_track *out);
+/* Re-runs the personal pass (from the population fits already in t) with per-frame canonical
+ * visibility vis [F][128 * 160] in [0, 1] (plx_fu_visibility): a sample's weight in the template
+ * and in the frame's fit is multiplied by it, so a frame contributes nothing where that part of
+ * the surface faces away or is hidden (the far flank of the nose at a turn). */
+void plx_fu_track_retrack(const plx_fl_fitter *pop, const plx_img *grays, const float *vis, const plx_fu_track_opts *o,
+                          plx_fu_track *t);
 void plx_fu_track_free(plx_fu_track *t);
 /* x [F][2][nodes]: image (crop) positions W_f(p_n) of the personal lattice nodes; pop = true uses
  * the population fits (8-px nodes when lat is 8 px; refined exactly onto a 4-px lattice). */
@@ -180,10 +196,14 @@ typedef struct {
     double   robust_k;      /* Cauchy weight 1 / (1 + (e / (k σ))²) per entry (default 3) */
     double   nonrigid_k;    /* per-node 1 / (1 + (rms / (k median))²) (default 2; <= 0 off) */
     bool     visibility;    /* weight entries by surface visibility from round 2 on (default true) */
-    double   degen_spread_deg; /* bas-relief fallback when the 2nd rotation-axis spread is below (default 3) */
-    double   degen_gap;     /* ... or the metric gap σ5/σ1 is below (default 1e-3) */
-    int      prior_scale;   /* -1 automatic (default), 0 never, 1 always */
-    int      boot;          /* parametric bootstrap resamples for the uncertainty (default 40; 0 = none) */
+    double   prior_scale_sd;/* relative sd of the population prior on a person's depth scale (default 0.15) */
+    int      prior_scale;   /* depth scale: -1 metric fused with the prior by precision (default), 0 metric
+                             * only, 1 prior only */
+    int      boot;          /* parametric bootstrap resamples for the uncertainty (default 40; 0 = none;
+                             * the automatic depth-scale fusion always runs at least 16 of the metric
+                             * solution to know its precision) */
+    bool     boot_frames;   /* with F >= 8, also resample whole frames and keep the larger spread
+                             * (default true; factor.c says why) */
     uint64_t seed;
 } plx_fu_factor_opts;
 plx_fu_factor_opts plx_fu_factor_defaults(void);
@@ -207,15 +227,17 @@ typedef struct {
     double  spread_deg[3]; /* principal angular spreads of the frame rotations about their mean, deg */
     double  axis[3][3]; /* the corresponding axes (rows), canonical gauge */
     double  L_min_eig;  /* smallest eigenvalue of L / largest (< 0: L projected to PSD) */
-    bool    degenerate; /* bas-relief fallback used */
+    double  scale_sd_metric; /* bootstrap relative sd of the METRIC solution's depth scale (NaN: not run) */
+    double  prior_weight;/* weight of the prior in the fused depth scale, sd_m² / (sd_m² + sd_prior²) */
+    bool    degenerate; /* bas-relief: the prior outweighs the motion (prior_weight > 0.5) */
     double  depth_ratio;/* ⟨z, zp⟩ / ⟨zp, zp⟩ (centred, gw-weighted) of the metric solution */
-    double  prior_scale;/* factor applied to z by the fallback (1 when not degenerate) */
+    double  prior_scale;/* factor applied to z by the fusion: ratio^(-prior_weight) (1 = metric) */
     double  corr;       /* depth correlation with zp of the kept solution ... */
     double  corr_mirror;/* ... and of its mirror (depth-reflected) twin, rejected. Which of the two
                          * the metric upgrade happens to return is arbitrary (the handedness of the
                          * affine factors is), so only the margin between these is meaningful */
     double  gauge_rms;  /* Procrustes residual to (X0, Y0, zp), px */
-    double  scale_sd;   /* bootstrap relative sd of the depth scale (projection on the estimate) */
+    double  scale_sd;   /* bootstrap relative sd of the final depth scale (NaN without bootstrap) */
     int     n_boot;
 } plx_fu_shape;
 
@@ -280,6 +302,9 @@ typedef struct {
  * (C x 128 x 160) and the weight sum. */
 void plx_fu_fuse_texture(const plx_img *frames, int F, const plx_fu_track *tr, const plx_fu_shape *sh,
                          const double *dense_S, plx_img *texture, plx_img *weight);
+/* Per-frame visibility of every canonical pixel (vis [F][128 * 160]) of the dense surface at the
+ * shape's poses, in a w x h crop (plx_fu_grid_visibility on the dense grid). */
+void plx_fu_visibility(const plx_fu_shape *sh, const double *dense_S, int w, int h, float *vis);
 /* Dense (128 x 160) canonical-gauge surface from a lattice shape (Catmull-Rom over the nodes,
  * NaN-filled harmonically, NaN outside the estimated region when mask is set). S_lat [3][P]. */
 void plx_fu_dense_surface(const plx_lattice *L, const double *S_lat, const uint8_t *used, bool mask, double *dense);

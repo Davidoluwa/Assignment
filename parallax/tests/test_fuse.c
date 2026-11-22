@@ -285,47 +285,68 @@ static double prior_ratio(const face_pts *fp, const plx_fu_shape *sh) {
     return ab / bb;
 }
 
+/* Single-axis motion: yaw sweep ±amp only (no nod, no roll), scale drift kept. */
+static void yaw_only_tracks(const face_pts *fp, int F, double amp, double noise, uint64_t seed, tracks *t) {
+    make_tracks(fp, F, amp, 0, noise, 0, seed, t);
+    plx_rng r;
+    plx_rng_seed(&r, seed + 1);
+    for (int f = 0; f < F; f++) {
+        plx_rot_ypr(amp * DEG * sin(2 * M_PI * f / F), 0, 0, t->R[f]);
+        for (int n = 0; n < GP; n++)
+            for (int c = 0; c < 2; c++) {
+                const double *R = t->R[f];
+                t->x[((size_t)f * 2 + c) * GP + n] =
+                    t->s[f] * (R[c * 3] * fp->S[n] + R[c * 3 + 1] * fp->S[GP + n] + R[c * 3 + 2] * fp->S[2 * GP + n]) +
+                    125 + noise * plx_rng_normal(&r);
+            }
+    }
+}
+
 TEST(degenerate_motion) {
     face_pts fp;
     make_face(&fp, 22, 1);
     plx_fu_factor_opts o = plain_opts();
     o.prior_scale = -1;
     o.visibility = false;
-    /* yaw only (no nod, no roll): one rotation axis */
+    o.boot = 0; /* the depth-scale decision runs its own bootstrap */
+    /* a tiny single-axis turn: depth scale and rotation amplitude trade off (bas-relief); the
+     * metric solution's bootstrap says so and the prior takes over */
     tracks t;
-    make_tracks(&fp, 30, 25, 0, 0.3, 0, 31, &t);
-    for (int f = 0; f < t.F; f++) {
-        plx_rot_ypr(25 * DEG * sin(2 * M_PI * f / t.F), 0, 0, t.R[f]);
-        /* regenerate positions with the single-axis rotation */
-    }
-    {
-        plx_rng r;
-        plx_rng_seed(&r, 32);
-        for (int f = 0; f < t.F; f++)
-            for (int n = 0; n < GP; n++)
-                for (int c = 0; c < 2; c++) {
-                    const double *R = t.R[f];
-                    t.x[((size_t)f * 2 + c) * GP + n] = t.s[f] * (R[c * 3] * fp.S[n] + R[c * 3 + 1] * fp.S[GP + n] +
-                                                                  R[c * 3 + 2] * fp.S[2 * GP + n]) +
-                                                        125 + 0.3 * plx_rng_normal(&r);
-                }
-    }
+    yaw_only_tracks(&fp, 30, 3, 0.3, 31, &t);
     plx_fu_tracks tr = as_tracks(&fp, &t);
     plx_fu_shape sh;
     CHECK(plx_fu_factorise(&tr, &o, &sh) == PLX_OK);
-    printf("  yaw only: spreads %.2f %.2f %.2f deg, gap %.2e -> degenerate %d, prior scale %.3f\n", sh.spread_deg[0],
-           sh.spread_deg[1], sh.spread_deg[2], sh.gap, sh.degenerate, sh.prior_scale);
-    CHECK(sh.degenerate);
-    CHECK_NEAR(prior_ratio(&fp, &sh), 1.0, 1e-9); /* the fallback's defining property */
+    printf("  yaw +-3 only: spreads %.2f %.2f deg, gap %.2e, metric scale sd %.3f -> prior weight %.3f, degenerate %d\n",
+           sh.spread_deg[0], sh.spread_deg[1], sh.gap, sh.scale_sd_metric, sh.prior_weight, sh.degenerate);
+    CHECK(sh.degenerate && sh.prior_weight > 0.5);
+    /* the fusion's defining property: the person's projection on the prior pattern is the metric
+     * one raised to (1 - prior weight); 1 would be the pure prior */
+    CHECK_NEAR(prior_ratio(&fp, &sh), pow(sh.depth_ratio, 1 - sh.prior_weight), 1e-6);
+    plx_fu_shape_free(&sh);
+    /* the prior alone, forced: the projection equals the prior's exactly */
+    o.prior_scale = 1;
+    CHECK(plx_fu_factorise(&tr, &o, &sh) == PLX_OK);
+    CHECK_NEAR(prior_ratio(&fp, &sh), 1.0, 1e-9);
     plx_fu_shape_free(&sh);
     tracks_free(&t);
-    /* yaw + nod: well posed, the metric solution stands */
+    /* a wide single-axis sweep is NOT degenerate: foreshortening (cos θ) pins the scale */
+    o.prior_scale = -1;
+    yaw_only_tracks(&fp, 30, 30, 0.3, 32, &t);
+    tr = as_tracks(&fp, &t);
+    CHECK(plx_fu_factorise(&tr, &o, &sh) == PLX_OK);
+    double s, R[9], tt[3], e = shape_err(&fp, &sh, &s, R, tt);
+    printf("  yaw +-30 only: spreads %.2f %.2f deg, metric scale sd %.3f -> prior weight %.3f; shape error %.3f px\n",
+           sh.spread_deg[0], sh.spread_deg[1], sh.scale_sd_metric, sh.prior_weight, e);
+    CHECK(!sh.degenerate && sh.prior_weight < 0.2 && e < 0.6);
+    plx_fu_shape_free(&sh);
+    tracks_free(&t);
+    /* yaw + nod: well posed */
     make_tracks(&fp, 30, 25, 12, 0.3, 0, 33, &t);
     tr = as_tracks(&fp, &t);
     CHECK(plx_fu_factorise(&tr, &o, &sh) == PLX_OK);
-    printf("  yaw + nod: spreads %.2f %.2f %.2f deg, gap %.2e -> degenerate %d, depth ratio %.3f\n", sh.spread_deg[0],
-           sh.spread_deg[1], sh.spread_deg[2], sh.gap, sh.degenerate, sh.depth_ratio);
-    CHECK(!sh.degenerate && sh.prior_scale == 1);
+    printf("  yaw +-25 nod +-12: spreads %.2f %.2f deg, metric scale sd %.3f -> prior weight %.3f\n", sh.spread_deg[0],
+           sh.spread_deg[1], sh.scale_sd_metric, sh.prior_weight);
+    CHECK(!sh.degenerate && sh.prior_weight < 0.1);
     plx_fu_shape_free(&sh);
     tracks_free(&t);
 }
@@ -416,6 +437,66 @@ TEST(visibility) {
     CHECK(vis[5 * NX + 1] > 0.5); /* the near side */
 }
 
+/* An LFW photo pasted at scale 1.3 into a cluttered 360 x 300 frame is found: the face centre
+ * within a tenth of a face, the scale within 10 %. Truth = the photo's flow-stage similarity
+ * (runs/main/flow/sim.plxt, row 0 = AJ_Cook_0001) carried through the paste. */
+TEST(locate_pasted_face) {
+    const char *jpg = "data/lfw/AJ_Cook/AJ_Cook_0001.jpg", *simp = "runs/main/flow/sim.plxt", *model = "runs/main/flow/model";
+    if (access(jpg, R_OK) || access(simp, R_OK) || access(model, R_OK)) {
+        printf("  skipped: needs %s, %s and %s\n", jpg, simp, model);
+        return;
+    }
+    plx_img rgb, gray;
+    plx_tensor sim;
+    plx_fl_model m;
+    CHECK(plx_img_load(jpg, &rgb) == PLX_OK);
+    CHECK(plx_tensor_load(simp, &sim) == PLX_OK);
+    CHECK(plx_fl_model_load(model, &m) == PLX_OK);
+    gray = plx_img_luma(&rgb);
+    const float *s = sim.data;
+    plx_sim T = {s[0], s[1], s[2], s[3]};
+    plx_fu_synth_opts so = plx_fu_synth_defaults();
+    so.frame_w = 360, so.frame_h = 300, so.clutter = true, so.seed = 9;
+    plx_img frame = plx_fu_synth_background(&so, 1);
+    double g = 1.3, ox = 140, oy = -20, fcx, fcy;
+    plx_sim_apply(T, PLX_CANON_CX, PLX_CANON_CY, &fcx, &fcy);
+    for (int y = 0; y < frame.h; y++)
+        for (int x = 0; x < frame.w; x++) {
+            double qx = (x - ox) / g, qy = (y - oy) / g, ex = (qx - fcx) / 75, ey = (qy - fcy) / 95;
+            double al = PLX_CLAMP((1.15 - sqrt(ex * ex + ey * ey)) / 0.15, 0.0, 1.0);
+            if (al > 0 && qx >= 0 && qy >= 0 && qx <= 249 && qy <= 249)
+                PLX_PX(&frame, x, y, 0) = (float)((1 - al) * PLX_PX(&frame, x, y, 0) +
+                                                  al * plx_sample1(&gray, 0, PLX_INTERP_BILINEAR, (float)qx, (float)qy));
+        }
+    plx_fu_locator L;
+    plx_fu_locator_init(&L, &m);
+    plx_fu_locate_opts lo = plx_fu_locate_defaults();
+    plx_fu_located r = plx_fu_locate(&L, &frame, &lo);
+    double ex, ey;
+    plx_sim_apply(r.T, PLX_CANON_CX, PLX_CANON_CY, &ex, &ey);
+    double err = hypot(ex - (g * fcx + ox), ey - (g * fcy + oy)) / (100 * g), sr = plx_sim_scale(r.T) / (g * plx_sim_scale(T));
+    printf("  pasted face: centre error %.3f faces, scale ratio %.3f, score %.3f (runner-up %.3f)\n", err, sr, r.score,
+           r.runner_score);
+    CHECK(err < 0.1);
+    CHECK(fabs(log(sr)) < 0.1);
+    CHECK(r.score > r.runner_score);
+    /* the window built from it is the LFW layout: the face's canonical centre at (124.5, 128.5) */
+    plx_fu_window w = plx_fu_window_for(r.T);
+    plx_sim C = plx_fu_sim_to_crop(w, r.T);
+    double cx, cy;
+    plx_sim_apply(C, PLX_CANON_CX, PLX_CANON_CY, &cx, &cy);
+    CHECK_NEAR(cx, PLX_CANON_IMG_CX, 1e-9);
+    CHECK_NEAR(cy, PLX_CANON_IMG_CY, 1e-9);
+    CHECK_NEAR(plx_sim_scale(C), 1, 1e-12);
+    plx_sim back = plx_fu_sim_to_frame(w, C);
+    CHECK_NEAR(back.tx, r.T.tx, 1e-9);
+    CHECK_NEAR(back.ty, r.T.ty, 1e-9);
+    plx_fu_locator_free(&L);
+    plx_fl_model_free(&m);
+    plx_img_free(&rgb), plx_img_free(&gray), plx_img_free(&frame);
+    plx_tensor_free(&sim);
+}
+
 int main(void) {
     const char *base = getenv("PLX_TEST_TMP");
     snprintf(g_dir, sizeof g_dir, "%s/plx_test_fuse_%d", base ? base : "/tmp", (int)getpid());
@@ -428,5 +509,6 @@ int main(void) {
     RUN(mirror_sign);
     RUN(uncertainty_calibration);
     RUN(visibility);
+    RUN(locate_pasted_face);
     return TEST_REPORT();
 }

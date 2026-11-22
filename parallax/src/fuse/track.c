@@ -18,7 +18,7 @@
 enum { MAX_DOF = 2 * PLX_LAT_MAX_NODES, MAX_STAGES = 2 };
 
 plx_fu_track_opts plx_fu_track_defaults(void) {
-    return (plx_fu_track_opts){.rounds = 3, .step = 8, .lambda = 3, .iters = 10, .coarse = true};
+    return (plx_fu_track_opts){.rounds = 4, .step = 8, .lambda = 0.5f, .iters = 10, .coarse = true};
 }
 
 /* ---- sampled views ------------------------------------------------------------------------------ */
@@ -42,6 +42,7 @@ static void sample_level(const plx_img *src, int level, int margin, const plx_la
 /* ---- the clip ---------------------------------------------------------------------------------- */
 typedef struct {
     const plx_img       *grays;
+    const float         *vis;    /* [F][Ω] canonical visibility (nullable) */
     const plx_fl_ref    *refs;
     int                  n_refs;
     const plx_fl_params *p;
@@ -50,6 +51,7 @@ typedef struct {
     float               *ub;     /* [F][dof] population fields on the personal lattice */
     float               *a;      /* [F][dof] personal increments */
     double              *s1[PLX_CG_MAX_LEVELS], *s2[PLX_CG_MAX_LEVELS]; /* [threads][level size] template sums */
+    double              *s0[PLX_CG_MAX_LEVELS]; /* [threads][level plane] weight sums */
     double              *gsum;   /* [threads][Ω+] gray sums */
     size_t               lsize[PLX_CG_MAX_LEVELS], gsize;
     plx_fl_nodestat     *ns;     /* [F] final pass */
@@ -63,15 +65,32 @@ static void pass_one(int64_t f, int tid, void *pc) {
     float *ub = c->ub + (size_t)f * dof, *a = c->a + (size_t)f * dof;
     plx_cg_view *v = &c->views[f];
     if (c->mode == 0) {
-        plx_fl_render(&c->grays[f], t->T_pop[f], &t->lat, ub, &c->p->cg, v);
+        /* the validity of a sample is "came from the photo" x "that surface point faces the
+         * camera and is not hidden": the solver and the template both weigh by it */
+        v->gray = plx_canon_new(1, margin);
+        v->valid = plx_canon_new(1, margin);
+        plx_fl_render_gray(&c->grays[f], t->T_pop[f], &t->lat, ub, margin, c->p->cg.interp, &v->gray, &v->valid);
+        if (c->vis) {
+            const float *vf = c->vis + (size_t)f * PLX_CANON_W * PLX_CANON_H;
+            for (int y = 0; y < PLX_CANON_H; y++)
+                for (int x = 0; x < PLX_CANON_W; x++) PLX_PX(&v->valid, x + margin, y + margin, 0) *= vf[y * PLX_CANON_W + x];
+        }
+        plx_cg_view_finish(&c->p->cg, v);
     } else if (c->mode == 1) {
         for (int l = 0; l < v->feat.n; l++) {
             const plx_img *src = &v->feat.lev[l];
-            plx_img s = plx_img_new(src->w, src->h, src->c);
+            size_t plane = (size_t)src->w * src->h;
+            plx_img s = plx_img_new(src->w, src->h, src->c), sv = plx_img_new(src->w, src->h, 1);
             sample_level(src, l, margin, &t->lat, a, &s);
+            sample_level(&v->vpyr.lev[l], l, margin, &t->lat, a, &sv);
             double *s1 = c->s1[l] + (size_t)tid * c->lsize[l], *s2 = c->s2[l] + (size_t)tid * c->lsize[l];
-            for (size_t k = 0; k < c->lsize[l]; k++) s1[k] += s.px[k], s2[k] += (double)s.px[k] * s.px[k];
-            plx_img_free(&s);
+            double *s0 = c->s0[l] + (size_t)tid * plane;
+            for (size_t k = 0; k < c->lsize[l]; k++) {
+                double w = sv.px[k % plane];
+                s1[k] += w * s.px[k], s2[k] += w * (double)s.px[k] * s.px[k];
+            }
+            for (size_t k = 0; k < plane; k++) s0[k] += sv.px[k];
+            plx_img_free(&s), plx_img_free(&sv);
         }
         plx_img g = plx_img_new(v->gray.w, v->gray.h, 1);
         sample_level(&v->gray, 0, margin, &t->lat, a, &g);
@@ -91,13 +110,20 @@ static void pass_one(int64_t f, int tid, void *pc) {
     }
 }
 
+static int cmp_double(const void *a, const void *b) {
+    double x = *(const double *)a, y = *(const double *)b;
+    return (x > y) - (x < y);
+}
+
 static void build_template(pass_ctx *c, int F, plx_img *gray_out) {
     const plx_cg_params *p = &c->p->cg;
     plx_fu_track *t = c->t;
     int nt = plx_num_threads();
     for (int l = 0; l < p->levels; l++) {
+        size_t plane = c->lsize[l] / p->feat.k;
         memset(c->s1[l], 0, sizeof(double) * c->lsize[l] * nt);
         memset(c->s2[l], 0, sizeof(double) * c->lsize[l] * nt);
+        memset(c->s0[l], 0, sizeof(double) * plane * nt);
     }
     memset(c->gsum, 0, sizeof(double) * c->gsize * nt);
     c->mode = 1;
@@ -106,15 +132,36 @@ static void build_template(pass_ctx *c, int F, plx_img *gray_out) {
     t->tmpl.K = p->feat.k, t->tmpl.margin = p->margin, t->tmpl.levels = p->levels, t->tmpl.count = F;
     for (int l = 0; l < p->levels; l++) {
         const plx_img *f0 = &c->views[0].feat.lev[l];
+        size_t plane = (size_t)f0->w * f0->h;
         t->tmpl.mean[l] = plx_img_new(f0->w, f0->h, f0->c);
         t->tmpl.var[l] = plx_img_new(f0->w, f0->h, f0->c);
+        double *seen = PLX_NEW(double, c->lsize[l]);
+        int ns = 0;
         for (size_t k = 0; k < c->lsize[l]; k++) {
-            double s1 = 0, s2 = 0;
-            for (int th = 0; th < nt; th++) s1 += c->s1[l][th * c->lsize[l] + k], s2 += c->s2[l][th * c->lsize[l] + k];
-            double m = s1 / F;
+            double s0 = 0, s1 = 0, s2 = 0;
+            for (int th = 0; th < nt; th++) {
+                s0 += c->s0[l][th * plane + k % plane];
+                s1 += c->s1[l][th * c->lsize[l] + k], s2 += c->s2[l][th * c->lsize[l] + k];
+            }
+            double m = s0 > 0 ? s1 / s0 : 0, v = s0 > 0 ? fmax(s2 / s0 - m * m, 0) : NAN;
             t->tmpl.mean[l].px[k] = (float)m;
-            t->tmpl.var[l].px[k] = (float)fmax(s2 / F - m * m, 0);
+            t->tmpl.var[l].px[k] = (float)v;
+            if (s0 >= 0.5) seen[ns++] = v;
         }
+        /* a pixel no frame saw (weight below half a frame) is made untrustworthy, not exact: 10 x
+         * the median variance of the seen ones (not their maximum, which would also inflate the
+         * solver's variance floor, a median over the window) */
+        double vun = 1;
+        if (ns > 0) {
+            qsort(seen, ns, sizeof(double), cmp_double);
+            vun = 10 * seen[ns / 2];
+        }
+        for (size_t k = 0; k < c->lsize[l]; k++) {
+            double s0 = 0;
+            for (int th = 0; th < nt; th++) s0 += c->s0[l][th * plane + k % plane];
+            if (s0 < 0.5) t->tmpl.var[l].px[k] = (float)vun;
+        }
+        free(seen);
     }
     plx_img ext = plx_img_new(c->views[0].gray.w, c->views[0].gray.h, 1);
     for (size_t k = 0; k < c->gsize; k++) {
@@ -127,43 +174,27 @@ static void build_template(pass_ctx *c, int F, plx_img *gray_out) {
     plx_img_free(&ext);
 }
 
-void plx_fu_track_clip(const plx_fl_fitter *pop, const plx_img *grays, int F, plx_sim T0, const plx_fu_track_opts *o,
-                       plx_fu_track *t) {
-    PLX_ASSERT(F >= 1 && (o->step == 4 || o->step == 8) && o->rounds <= 8);
-    const plx_fl_model *m = pop->m;
+/* The personal pass (from the population fits in t), with optional per-frame visibility. */
+static void personal_pass(const plx_fl_model *m, const plx_img *grays, const float *vis, const plx_fu_track_opts *o,
+                          plx_fu_track *t) {
     plx_lattice L8 = plx_lattice_make(PLX_FL_STEP);
-    int d8 = plx_lat_dof(&L8);
-    memset(t, 0, sizeof *t);
-    t->F = F;
-    t->lat = plx_lattice_make(o->step);
-    int dof = plx_lat_dof(&t->lat), N = plx_lat_nodes(&t->lat), nt = plx_num_threads();
-    t->T_pop = PLX_NEW(plx_sim, F);
-    t->u_pop = PLX_NEW(float, (size_t)F * d8);
-    t->T = PLX_NEW(plx_sim, F);
-    t->u = PLX_NEW(float, (size_t)F * dof);
-    t->cost_pop = PLX_NEW(double, F);
-    t->cost_pp = PLX_NEW(double, F);
-    t->cost = PLX_NEW(double, F);
-    t->node_cost = PLX_NEW(float, (size_t)F * N);
-    t->node_data = PLX_NEW(float, N);
-
-    /* population pass, warm-started from the previous frame's similarity */
-    plx_sim Tw = T0;
-    for (int f = 0; f < F; f++) {
-        plx_fl_fit fit = plx_fl_fit_image(pop, &grays[f], Tw, &t->T_pop[f], t->u_pop + (size_t)f * d8);
-        t->cost_pop[f] = fit.cost;
-        Tw = t->T_pop[f];
-    }
+    int F = t->F, d8 = plx_lat_dof(&L8), dof = plx_lat_dof(&t->lat), N = plx_lat_nodes(&t->lat), nt = plx_num_threads();
+    memset(t->drift, 0, sizeof t->drift);
 
     /* personal stages: (level 1), level 0, both on the personal lattice; damping and prox as
-     * the population's sampled stages, the bending weight the personal one */
+     * the population's sampled stages, the bending weight the personal one. Weights are the
+     * window alone (PLAIN): across one person's frames the feature variance is largest exactly
+     * where the parallax is (the nose, whose look changes with the view), so 1 / σ² would
+     * silence the signal: on the base synthetic clip it cost a third of the nose (15.2 vs 23.4 px
+     * recovered of 25). The variance still sets the Huber scale. */
     plx_fl_params p = m->p;
+    p.weighting = PLX_FL_W_PLAIN;
     plx_fl_stage st[MAX_STAGES];
     int ns = 0;
     if (o->coarse) st[ns++] = (plx_fl_stage){o->step, 1, 0, o->lambda, 0.3f, o->iters, 0};
     st[ns++] = (plx_fl_stage){o->step, 0, 0, o->lambda, 0.3f, o->iters, 0};
 
-    pass_ctx c = {.grays = grays, .p = &p, .t = t, .views = PLX_NEW(plx_cg_view, F),
+    pass_ctx c = {.grays = grays, .vis = vis, .p = &p, .t = t, .views = PLX_NEW(plx_cg_view, F),
                   .ub = PLX_NEW(float, (size_t)F * dof), .a = PLX_NEW(float, (size_t)F * dof)};
     for (int f = 0; f < F; f++) plx_lat_resample(&L8, t->u_pop + (size_t)f * d8, &t->lat, c.ub + (size_t)f * dof);
     c.mode = 0;
@@ -173,6 +204,7 @@ void plx_fu_track_clip(const plx_fl_fitter *pop, const plx_img *grays, int F, pl
         c.lsize[l] = (size_t)f0->w * f0->h * f0->c;
         c.s1[l] = PLX_NEW(double, c.lsize[l] * nt);
         c.s2[l] = PLX_NEW(double, c.lsize[l] * nt);
+        c.s0[l] = PLX_NEW(double, (size_t)f0->w * f0->h * nt);
     }
     c.gsize = (size_t)c.views[0].gray.w * c.views[0].gray.h;
     c.gsum = PLX_NEW(double, c.gsize * nt);
@@ -200,7 +232,10 @@ void plx_fu_track_clip(const plx_fl_fitter *pop, const plx_img *grays, int F, pl
         t->drift[r] = sqrt(rms / PLX_MAX(nc, 1));
         build_template(&c, F, &t->tmpl_gray);
     }
-    if (o->rounds == 0) t->tmpl_gray = plx_img_clone(&t->pop_gray);
+    if (o->rounds == 0) {
+        plx_img_free(&t->tmpl_gray);
+        t->tmpl_gray = plx_img_clone(&t->pop_gray);
+    }
 
     /* evaluation against the final personal template (level 0 stage) */
     refs[0] = plx_fl_ref_build(&t->tmpl, &p, &st[ns - 1]);
@@ -220,8 +255,42 @@ void plx_fu_track_clip(const plx_fl_fitter *pop, const plx_img *grays, int F, pl
         plx_cg_view_free(&c.views[f]);
     }
     free(nst);
-    for (int l = 0; l < p.cg.levels; l++) free(c.s1[l]), free(c.s2[l]);
+    for (int l = 0; l < p.cg.levels; l++) free(c.s1[l]), free(c.s2[l]), free(c.s0[l]);
     free(c.gsum), free(c.views), free(c.ub), free(c.a);
+}
+
+void plx_fu_track_clip(const plx_fl_fitter *pop, const plx_img *grays, int F, plx_sim T0, const plx_fu_track_opts *o,
+                       plx_fu_track *t) {
+    PLX_ASSERT(F >= 1 && (o->step == 4 || o->step == 8) && o->rounds <= 8);
+    plx_lattice L8 = plx_lattice_make(PLX_FL_STEP);
+    int d8 = plx_lat_dof(&L8);
+    memset(t, 0, sizeof *t);
+    t->F = F;
+    t->lat = plx_lattice_make(o->step);
+    int dof = plx_lat_dof(&t->lat), N = plx_lat_nodes(&t->lat);
+    t->T_pop = PLX_NEW(plx_sim, F);
+    t->u_pop = PLX_NEW(float, (size_t)F * d8);
+    t->T = PLX_NEW(plx_sim, F);
+    t->u = PLX_NEW(float, (size_t)F * dof);
+    t->cost_pop = PLX_NEW(double, F);
+    t->cost_pp = PLX_NEW(double, F);
+    t->cost = PLX_NEW(double, F);
+    t->node_cost = PLX_NEW(float, (size_t)F * N);
+    t->node_data = PLX_NEW(float, N);
+    /* population pass, warm-started from the previous frame's similarity */
+    plx_sim Tw = T0;
+    for (int f = 0; f < F; f++) {
+        plx_fl_fit fit = plx_fl_fit_image(pop, &grays[f], Tw, &t->T_pop[f], t->u_pop + (size_t)f * d8);
+        t->cost_pop[f] = fit.cost;
+        Tw = t->T_pop[f];
+    }
+    personal_pass(pop->m, grays, NULL, o, t);
+}
+
+void plx_fu_track_retrack(const plx_fl_fitter *pop, const plx_img *grays, const float *vis, const plx_fu_track_opts *o,
+                          plx_fu_track *t) {
+    PLX_ASSERT(o->step == (int)t->lat.step);
+    personal_pass(pop->m, grays, vis, o, t);
 }
 
 void plx_fu_track_free(plx_fu_track *t) {

@@ -66,24 +66,42 @@ void plx_fu_dense_surface(const plx_lattice *L, const double *S_lat, const uint8
     free(f), free(g);
 }
 
+/* ---- visibility ---------------------------------------------------------------------------------- */
+typedef struct {
+    const plx_fu_shape *sh;
+    const double       *dense;
+    int                 w, h;
+    float              *vis;
+} vis_ctx;
+
+static void vis_one(int64_t f, int tid, void *pc) {
+    (void)tid;
+    vis_ctx *c = pc;
+    int WH = PLX_CANON_W * PLX_CANON_H;
+    double *v = PLX_NEW(double, WH);
+    plx_fu_grid_visibility(c->dense, NULL, PLX_CANON_W, PLX_CANON_H, c->sh->R + f * 9, c->sh->scale[f], c->sh->tx[f],
+                           c->sh->ty[f], c->w, c->h, v);
+    for (int k = 0; k < WH; k++) c->vis[(size_t)f * WH + k] = (float)v[k];
+    free(v);
+}
+
+void plx_fu_visibility(const plx_fu_shape *sh, const double *dense_S, int w, int h, float *vis) {
+    vis_ctx c = {.sh = sh, .dense = dense_S, .w = w, .h = h, .vis = vis};
+    plx_parallel_for(sh->F, 1, vis_one, &c);
+}
+
 /* ---- fused texture ------------------------------------------------------------------------------ */
 typedef struct {
     const plx_img      *frames;
     const plx_fu_track *tr;
-    const plx_fu_shape *sh;
-    const double       *dense;
     plx_img            *warped; /* [F] */
-    double             *vis;    /* [F][W H] */
 } tex_ctx;
 
 static void tex_one(int64_t f, int tid, void *pc) {
     (void)tid;
     tex_ctx *c = pc;
     const plx_fu_track *t = c->tr;
-    int dof = plx_lat_dof(&t->lat), WH = PLX_CANON_W * PLX_CANON_H;
-    c->warped[f] = plx_fl_warp_crop(&c->frames[f], t->T[f], &t->lat, t->u + (size_t)f * dof);
-    plx_fu_grid_visibility(c->dense, NULL, PLX_CANON_W, PLX_CANON_H, c->sh->R + f * 9, c->sh->scale[f], c->sh->tx[f],
-                           c->sh->ty[f], c->frames[f].w, c->frames[f].h, c->vis + (size_t)f * WH);
+    c->warped[f] = plx_fl_warp_crop(&c->frames[f], t->T[f], &t->lat, t->u + (size_t)f * plx_lat_dof(&t->lat));
 }
 
 static int cmp_double(const void *a, const void *b) {
@@ -94,15 +112,16 @@ static int cmp_double(const void *a, const void *b) {
 void plx_fu_fuse_texture(const plx_img *frames, int F, const plx_fu_track *tr, const plx_fu_shape *sh,
                          const double *dense_S, plx_img *texture, plx_img *weight) {
     int W = PLX_CANON_W, H = PLX_CANON_H, WH = W * H, C = frames[0].c;
-    tex_ctx c = {.frames = frames, .tr = tr, .sh = sh, .dense = dense_S, .warped = PLX_NEW(plx_img, F),
-                 .vis = PLX_NEW(double, (size_t)F * WH)};
+    tex_ctx c = {.frames = frames, .tr = tr, .warped = PLX_NEW(plx_img, F)};
     plx_parallel_for(F, 1, tex_one, &c);
+    float *vis = PLX_NEW(float, (size_t)F * WH);
+    plx_fu_visibility(sh, dense_S, frames[0].w, frames[0].h, vis);
     /* gain: each frame's visibility-weighted mean brightness, matched to the median frame's */
     double *mean = PLX_NEW(double, F), *srt = PLX_NEW(double, F), *fw = PLX_NEW(double, F);
     for (int f = 0; f < F; f++) {
         double sw = 0, sv = 0;
         for (int k = 0; k < WH; k++) {
-            double v = c.vis[(size_t)f * WH + k];
+            double v = vis[(size_t)f * WH + k];
             if (v <= 0.5) continue;
             double lum = 0;
             for (int ch = 0; ch < C; ch++) lum += c.warped[f].px[(size_t)ch * WH + k] / C;
@@ -121,7 +140,7 @@ void plx_fu_fuse_texture(const plx_img *frames, int F, const plx_fu_track *tr, c
         double sw = 0, acc[3] = {0}, plain[3] = {0};
         for (int f = 0; f < F; f++) {
             double g = isfinite(mean[f]) && mean[f] > 0 ? ref / mean[f] : 1;
-            double wv = fw[f] * c.vis[(size_t)f * WH + k];
+            double wv = fw[f] * vis[(size_t)f * WH + k];
             for (int ch = 0; ch < C; ch++) {
                 double v = g * c.warped[f].px[(size_t)ch * WH + k];
                 acc[ch] += wv * v;
@@ -134,7 +153,7 @@ void plx_fu_fuse_texture(const plx_img *frames, int F, const plx_fu_track *tr, c
         weight->px[k] = (float)sw;
     }
     for (int f = 0; f < F; f++) plx_img_free(&c.warped[f]);
-    free(c.warped), free(c.vis), free(mean), free(srt), free(fw);
+    free(c.warped), free(vis), free(mean), free(srt), free(fw);
 }
 
 /* ---- record -------------------------------------------------------------------------------------- */

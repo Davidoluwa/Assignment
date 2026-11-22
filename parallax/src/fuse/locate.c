@@ -264,19 +264,25 @@ plx_fu_located plx_fu_locate(const plx_fu_locator *L, const plx_img *gray, const
     free(H);
 
     /* refinement: crop around the hypothesis, similarity alignment there (inside congealing's
-     * bounds), twice so the second crop is centred on the refined face; then re-scored */
+     * bounds), twice so the second crop is centred on the refined face; then re-scored. An
+     * alignment that runs off (it can shrink a face onto its own nose: 2 of 60 pasted LFW faces)
+     * scores worse than where it started, and the unrefined hypothesis is kept instead. */
     double *refined = PLX_NEW(double, nk);
     for (int i = 0; i < nk; i++) {
         plx_sim T = keep[i].T;
         plx_cg_fit fit = {0};
+        double s0 = 0;
         for (int pass = 0; pass < 2; pass++) {
             plx_fu_window w = plx_fu_window_for(T);
             plx_img crop = plx_fu_window_extract(gray, w);
-            plx_sim C = plx_cg_align_image(&crop, plx_fu_sim_to_crop(w, T), L->refs, L->stages, L->n_stages, p, &fit, NULL);
+            plx_sim C0 = plx_fu_sim_to_crop(w, T);
+            if (pass == 0) s0 = score_at(L, &ts, lev, &crop, C0);
+            plx_sim C = plx_cg_align_image(&crop, C0, L->refs, L->stages, L->n_stages, p, &fit, NULL);
             T = plx_fu_sim_to_frame(w, C);
             if (pass == 1) refined[i] = score_at(L, &ts, lev, &crop, C);
             plx_img_free(&crop);
         }
+        if (refined[i] < s0) T = keep[i].T, refined[i] = s0;
         keep[i].T = T;
         if (refined[i] > res.score) res.score = refined[i], res.T = T, res.search_score = keep[i].score, res.cost = fit.cost;
     }

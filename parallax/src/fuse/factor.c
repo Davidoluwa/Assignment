@@ -32,7 +32,7 @@
 
 plx_fu_factor_opts plx_fu_factor_defaults(void) {
     return (plx_fu_factor_opts){.als_iters = 300, .als_tol = 1e-10, .rounds = 4, .robust_k = 3, .nonrigid_k = 2,
-                                .visibility = true, .degen_spread_deg = 3, .degen_gap = 1e-3, .prior_scale = -1,
+                                .visibility = true, .prior_scale_sd = 0.15, .prior_scale = -1, .boot_frames = true,
                                 .boot = 40, .seed = 0xf05e};
 }
 
@@ -391,8 +391,7 @@ void plx_fu_grid_visibility(const double *S, const uint8_t *valid, int nx, int n
 typedef struct {
     double *M, *t, *S;      /* canonical gauge: [F][2][3], [F][2], [3][P] */
     double *R, *scale;      /* [F][9], [F] */
-    double  gap, min_eig, spread[3], axis[3][3], ratio, prior_scale, corr, corr_mirror, gauge_rms;
-    bool    flipped, degenerate;
+    double  gap, min_eig, spread[3], axis[3][3], ratio, prior_scale, prior_w, corr, corr_mirror, gauge_rms;
 } est;
 
 static void est_alloc(est *e, int F, int P) {
@@ -452,8 +451,8 @@ typedef struct {
     const double *X0, *Y0, *zp;
     const double *gw;      /* gauge weights (zero for unused nodes) */
     const plx_fu_factor_opts *o;
-    int force_flip;        /* -1 decide, else 0/1 */
-    int force_degen;       /* -1 decide, else 0/1 */
+    double sd_data;        /* relative sd of the metric depth scale: 0 = metric only, < 0 = prior only */
+    double sd_prior;       /* relative sd of the population prior on the depth scale */
 } est_in;
 
 static int estimate(const est_in *in, est *e) {
@@ -506,8 +505,9 @@ static int estimate(const est_in *in, est *e) {
                 Sc[c][r * P + n] = gs[c] * (gR[c][r * 3] * Sm[n] + gR[c][r * 3 + 1] * Sm[P + n] + gR[c][r * 3 + 2] * Sm[2 * P + n]) + gt[c][r];
         corr_ratio(P, Sc[c] + 2 * P, in->zp, in->gw, &corr[c], NULL);
     }
-    int c = in->force_flip >= 0 ? in->force_flip : corr[1] > corr[0];
-    e->flipped = c == 1;
+    /* the prior's sign decides, in every resample too: which index is the reflection depends on
+     * the arbitrary handedness of this run's affine factors, so an index cannot be carried over */
+    int c = corr[1] > corr[0];
     e->corr = corr[c], e->corr_mirror = corr[1 - c], e->gauge_rms = grms[c];
     memcpy(e->S, Sc[c], sizeof(double) * 3 * P);
     /* motion in the gauge: S_c = s R F S_a + tg  =>  M_c = M_a F Rᵀ / s, t_c = t_a - M_c tg */
@@ -546,19 +546,20 @@ static int estimate(const est_in *in, est *e) {
     }
     plx_mat_free(&C), plx_mat_free(&E);
 
-    /* bas-relief: depth scale from the population pattern when the motion cannot fix it */
+    /* bas-relief: the depth scale λ (z -> mean + λ (z - mean)) fused with the population prior
+     * in log space, precisions adding: the metric solution says λ = 1 with relative sd sd_data,
+     * the prior says λ = 1 / ratio (person's projection on zp = zp's own) with sd_prior */
     corr_ratio(P, e->S + 2 * P, in->zp, in->gw, NULL, &e->ratio);
-    bool degen = in->o->prior_scale == 1 ||
-                 (in->o->prior_scale < 0 && (e->spread[1] < in->o->degen_spread_deg || e->gap < in->o->degen_gap));
-    if (in->force_degen >= 0) degen = in->force_degen == 1;
-    e->degenerate = degen;
+    e->prior_w = 0;
+    if (in->sd_data < 0) e->prior_w = 1; /* the prior alone */
+    else if (in->sd_data > 0) e->prior_w = in->sd_data * in->sd_data / (in->sd_data * in->sd_data + in->sd_prior * in->sd_prior);
     e->prior_scale = 1;
-    if (degen && e->ratio > 0.05) {
+    if (e->prior_w > 0 && e->ratio > 0.05) {
         double W = 0, mz = 0;
         for (int n = 0; n < P; n++)
             if (in->gw[n] > 0) W += in->gw[n], mz += in->gw[n] * e->S[2 * P + n];
         mz /= W;
-        e->prior_scale = 1 / e->ratio;
+        e->prior_scale = exp(-e->prior_w * log(e->ratio));
         for (int n = 0; n < P; n++) e->S[2 * P + n] = mz + (e->S[2 * P + n] - mz) * e->prior_scale;
         solve_motion(F, P, in->x, in->w, e->S, e->M, e->t);
         for (int f = 0; f < F; f++) frame_rotation(e->M + f * 6, e->R + f * 9, &e->scale[f]);
@@ -596,6 +597,7 @@ typedef struct {
     double       *Sb;       /* [B][3][P] */
     uint8_t      *ok;       /* [B] */
     uint64_t      seed;
+    bool          frames;   /* resample whole frames of the real tracks instead of adding noise */
 } boot_ctx;
 
 static void boot_one(int64_t b, int tid, void *pc) {
@@ -604,27 +606,122 @@ static void boot_one(int64_t b, int tid, void *pc) {
     int F = in->F, P = in->P;
     plx_rng rng;
     plx_rng_seed(&rng, c->seed + 0x9e3779b97f4a7c15ull * (uint64_t)(b + 1));
-    double *xb = PLX_NEW(double, (size_t)F * 2 * P);
-    for (int f = 0; f < F; f++)
-        for (int n = 0; n < P; n++) {
-            if (in->w[(size_t)f * P + n] <= 0) continue;
-            for (int r = 0; r < 2; r++) {
-                const double *m = c->main->M + (f * 2 + r) * 3;
-                double mu = c->main->t[f * 2 + r] + m[0] * c->main->S[n] + m[1] * c->main->S[P + n] +
-                            m[2] * c->main->S[2 * P + n];
-                xb[((size_t)f * 2 + r) * P + n] = mu + c->noise_sd[(size_t)f * P + n] * plx_rng_normal(&rng);
-            }
-        }
+    double *xb = PLX_NEW(double, (size_t)F * 2 * P), *wb = NULL;
     est_in ib = *in;
+    if (c->frames) {
+        wb = PLX_NEW(double, (size_t)F * P);
+        for (int f = 0; f < F; f++) {
+            int g = (int)plx_rng_below(&rng, (uint32_t)F);
+            memcpy(xb + (size_t)f * 2 * P, in->x + (size_t)g * 2 * P, sizeof(double) * 2 * P);
+            memcpy(wb + (size_t)f * P, in->w + (size_t)g * P, sizeof(double) * P);
+        }
+        ib.w = wb;
+    } else {
+        for (int f = 0; f < F; f++)
+            for (int n = 0; n < P; n++) {
+                if (in->w[(size_t)f * P + n] <= 0) continue;
+                for (int r = 0; r < 2; r++) {
+                    const double *m = c->main->M + (f * 2 + r) * 3;
+                    double mu = c->main->t[f * 2 + r] + m[0] * c->main->S[n] + m[1] * c->main->S[P + n] +
+                                m[2] * c->main->S[2 * P + n];
+                    xb[((size_t)f * 2 + r) * P + n] = mu + c->noise_sd[(size_t)f * P + n] * plx_rng_normal(&rng);
+                }
+            }
+    }
     ib.x = xb;
-    ib.force_flip = c->main->flipped;
-    ib.force_degen = c->main->degenerate;
     est e;
     est_alloc(&e, F, P);
     c->ok[b] = estimate(&ib, &e) == PLX_OK;
     if (c->ok[b]) memcpy(c->Sb + (size_t)b * 3 * P, e.S, sizeof(double) * 3 * P);
     est_free(&e);
-    free(xb);
+    free(xb), free(wb);
+}
+
+/* Per-entry noise sd for the bootstrap: per-node residual level (2 nf coordinates, 3 of them
+ * spent on the node's own position), shrunk towards the pooled level with ν0 = 6 pseudo-degrees
+ * of freedom, divided by sqrt(weight). [F][P], caller frees. */
+static double *noise_model(const double *x, int F, int P, const double *w, const est *e) {
+    double pooled_num = 0, pooled_den = 0, *tau2 = PLX_NEW(double, P), *nsd = PLX_NEW(double, (size_t)F * P);
+    int *nf = PLX_NEW(int, P);
+    for (int n = 0; n < P; n++) {
+        double num = 0;
+        for (int f = 0; f < F; f++) {
+            double wk = w[(size_t)f * P + n];
+            if (wk <= 0) continue;
+            double r = residual(x, F, P, e, f, n);
+            num += wk * r * r;
+            nf[n]++;
+        }
+        tau2[n] = 2 * nf[n] > 3 ? num / (2 * nf[n] - 3) : NAN;
+        pooled_num += num, pooled_den += fmax(2 * nf[n] - 3, 0);
+    }
+    double pooled = pooled_den > 0 ? pooled_num / pooled_den : 0, nu0 = 6;
+    for (int n = 0; n < P; n++) {
+        double dofn = fmax(2 * nf[n] - 3, 0), t2 = isfinite(tau2[n]) ? (dofn * tau2[n] + nu0 * pooled) / (dofn + nu0) : pooled;
+        for (int f = 0; f < F; f++) {
+            size_t k = (size_t)f * P + n;
+            nsd[k] = w[k] > 0 ? sqrt(t2 / w[k]) : 0;
+        }
+    }
+    free(tau2), free(nf);
+    return nsd;
+}
+
+/* Robust spread: 1.4826 x the median absolute deviation (= sd for a Gaussian). A resample whose
+ * metric upgrade lands on the wrong side of an ill-conditioned L is a rare, wild outlier; with a
+ * plain sd one such resample in 40 made a clip's depth-scale sd 0.42 against 0.003-0.004 for
+ * its neighbours in a sweep. v is sorted in place. */
+static double robust_sd(double *v, int n) {
+    if (n < 2) return NAN;
+    double m = median(v, n);
+    for (int i = 0; i < n; i++) v[i] = fabs(v[i] - m);
+    return 1.4826 * median(v, n);
+}
+
+/* B resamples through estimate(in): the model e + noise (parametric), or the real tracks with
+ * whole frames drawn with replacement (frames). Returns the robust relative sd of the depth scale
+ * (regression of each resample's centred depth on e's); sd (nullable, [3][P]) gets the robust
+ * per-coordinate sd of the used nodes. */
+static double bootstrap_one_kind(const est_in *in, const est *e, const double *nsd, int B, uint64_t seed,
+                                 const double *gw, const uint8_t *used, bool frames, double *sd) {
+    int P = in->P;
+    boot_ctx bc = {.in = in, .main = e, .noise_sd = nsd, .Sb = PLX_NEW(double, (size_t)B * 3 * P),
+                   .ok = PLX_NEW(uint8_t, B), .seed = seed, .frames = frames};
+    plx_parallel_for(B, 1, boot_one, &bc);
+    int nb = 0;
+    double *v = PLX_NEW(double, B);
+    for (int b = 0; b < B; b++)
+        if (bc.ok[b]) corr_ratio(P, bc.Sb + (size_t)b * 3 * P + 2 * P, e->S + 2 * P, gw, NULL, &v[nb++]);
+    double out = robust_sd(v, nb);
+    if (sd)
+        for (int n = 0; n < P; n++)
+            for (int r = 0; r < 3; r++) {
+                size_t k = (size_t)r * P + n;
+                int m = 0;
+                for (int b = 0; b < B; b++)
+                    if (bc.ok[b]) v[m++] = bc.Sb[(size_t)b * 3 * P + k];
+                sd[k] = used[n] ? robust_sd(v, m) : NAN;
+            }
+    free(v), free(bc.Sb), free(bc.ok);
+    return out;
+}
+
+/* The parametric bootstrap knows only independent per-entry noise. Errors that move a whole frame
+ * coherently (an expression, a flow failure, a lighting change: everything that makes LFW photos
+ * of one person disagree) are seen only by resampling frames, which needs enough of them; with
+ * F >= 8 both are run and the larger spread is kept, per coordinate and for the depth scale. */
+static double bootstrap(const est_in *in, const est *e, const double *nsd, int B, uint64_t seed, const double *gw,
+                        const uint8_t *used, double *sd) {
+    double s1 = bootstrap_one_kind(in, e, nsd, B, seed, gw, used, false, sd);
+    if (in->F < 8 || !in->o->boot_frames) return s1;
+    int P = in->P;
+    double *sd2 = sd ? PLX_NEW(double, (size_t)3 * P) : NULL;
+    double s2 = bootstrap_one_kind(in, e, nsd, B, seed ^ 0xf4a3e5, gw, used, true, sd2);
+    if (sd)
+        for (size_t k = 0; k < (size_t)3 * P; k++)
+            if (isfinite(sd2[k]) && !(sd[k] >= sd2[k])) sd[k] = sd2[k];
+    free(sd2);
+    return isfinite(s2) && !(s1 >= s2) ? s2 : s1;
 }
 
 int plx_fu_factorise(const plx_fu_tracks *tr, const plx_fu_factor_opts *o, plx_fu_shape *out) {
@@ -651,7 +748,7 @@ int plx_fu_factorise(const plx_fu_tracks *tr, const plx_fu_factor_opts *o, plx_f
     est e;
     est_alloc(&e, F, P);
     est_in in = {.F = F, .P = P, .x = tr->x, .w = w, .X0 = tr->X0, .Y0 = tr->Y0, .zp = tr->zp, .gw = gw, .o = o,
-                 .force_flip = -1, .force_degen = -1};
+                 .sd_data = o->prior_scale == 1 ? -1 : 0, .sd_prior = o->prior_scale_sd};
     double *ebuf = PLX_NEW(double, (size_t)F * P + 1), *nrms = PLX_NEW(double, P), sigma = 0;
     int rounds = PLX_MAX(o->rounds, 1), st = PLX_OK;
     for (int round = 0; round < rounds; round++) {
@@ -705,6 +802,21 @@ int plx_fu_factorise(const plx_fu_tracks *tr, const plx_fu_factor_opts *o, plx_f
         return st;
     }
 
+    /* depth scale: the metric solution's own uncertainty decides how much the prior counts */
+    double *nsd = noise_model(tr->x, F, P, w, &e);
+    double scale_sd_metric = NAN;
+    if (o->prior_scale == 1) {
+        in.sd_data = -1;
+    } else if (o->prior_scale < 0 || o->boot > 1) {
+        scale_sd_metric = bootstrap(&in, &e, nsd, PLX_MAX(o->boot, 16), o->seed ^ 0x3e7a, gw, NULL, NULL);
+        if (o->prior_scale < 0) in.sd_data = isfinite(scale_sd_metric) ? scale_sd_metric : -1;
+    }
+    if (in.sd_data != 0 && (st = estimate(&in, &e)) != PLX_OK) {
+        est_free(&e);
+        free(used), free(gw), free(w), free(vis), free(ebuf), free(nrms), free(nsd);
+        return st;
+    }
+
     /* outputs */
     out->F = F, out->P = P;
     out->S = PLX_NEW(double, (size_t)3 * P);
@@ -748,72 +860,25 @@ int plx_fu_factorise(const plx_fu_tracks *tr, const plx_fu_factor_opts *o, plx_f
     out->L_min_eig = e.min_eig;
     memcpy(out->spread_deg, e.spread, sizeof e.spread);
     memcpy(out->axis, e.axis, sizeof e.axis);
-    out->degenerate = e.degenerate;
     out->depth_ratio = e.ratio;
     out->prior_scale = e.prior_scale;
+    out->prior_weight = e.prior_w;
+    out->degenerate = e.prior_w > 0.5;
+    out->scale_sd_metric = scale_sd_metric;
     out->corr = e.corr, out->corr_mirror = e.corr_mirror;
     out->gauge_rms = e.gauge_rms;
     for (int n = 0; n < P; n++)
         for (int r = 0; r < 3; r++) out->S[r * P + n] = used[n] ? e.S[r * P + n] : NAN;
 
-    /* bootstrap: per-entry noise sd = per-node level (shrunk to the pooled one) / sqrt(weight) */
+    /* per-node uncertainty of the final estimate (depth-scale fusion included) */
     for (size_t k = 0; k < (size_t)3 * P; k++) out->sd[k] = NAN;
+    out->scale_sd = NAN;
     if (o->boot > 1) {
-        double pooled_num = 0, pooled_den = 0;
-        double *tau2 = PLX_NEW(double, P);
-        for (int n = 0; n < P; n++) {
-            double num = 0;
-            int nf = 0;
-            for (int f = 0; f < F; f++) {
-                size_t k = (size_t)f * P + n;
-                if (w[k] <= 0) continue;
-                num += w[k] * out->res[k] * out->res[k];
-                nf++;
-            }
-            /* 2 nf coordinates, 3 of them spent on the node's own position */
-            tau2[n] = 2 * nf > 3 ? num / (2 * nf - 3) : NAN;
-            pooled_num += num, pooled_den += fmax(2 * nf - 3, 0);
-        }
-        double pooled = pooled_den > 0 ? pooled_num / pooled_den : 0, nu0 = 6;
-        double *nsd = PLX_NEW(double, (size_t)F * P);
-        for (int n = 0; n < P; n++) {
-            int nf = 0;
-            for (int f = 0; f < F; f++) nf += w[(size_t)f * P + n] > 0;
-            double dofn = fmax(2 * nf - 3, 0), t2 = isfinite(tau2[n]) ? (dofn * tau2[n] + nu0 * pooled) / (dofn + nu0) : pooled;
-            for (int f = 0; f < F; f++) {
-                size_t k = (size_t)f * P + n;
-                nsd[k] = w[k] > 0 ? sqrt(t2 / w[k]) : 0;
-            }
-        }
-        boot_ctx bc = {.in = &in, .main = &e, .noise_sd = nsd, .Sb = PLX_NEW(double, (size_t)o->boot * 3 * P),
-                       .ok = PLX_NEW(uint8_t, o->boot), .seed = o->seed};
-        plx_parallel_for(o->boot, 1, boot_one, &bc);
-        int nb = 0;
-        double *acc = PLX_NEW(double, (size_t)3 * P), *acc2 = PLX_NEW(double, (size_t)3 * P), rs = 0, rs2 = 0;
-        for (int b = 0; b < o->boot; b++) {
-            if (!bc.ok[b]) continue;
-            const double *Sb = bc.Sb + (size_t)b * 3 * P;
-            for (size_t k = 0; k < (size_t)3 * P; k++) acc[k] += Sb[k], acc2[k] += Sb[k] * Sb[k];
-            double ratio;
-            corr_ratio(P, Sb + 2 * P, e.S + 2 * P, gw, NULL, &ratio);
-            rs += ratio, rs2 += ratio * ratio;
-            nb++;
-        }
-        if (nb > 1) {
-            for (int n = 0; n < P; n++)
-                for (int r = 0; r < 3; r++) {
-                    size_t k = (size_t)r * P + n;
-                    double m = acc[k] / nb;
-                    out->sd[k] = used[n] ? sqrt(fmax(acc2[k] / nb - m * m, 0) * nb / (nb - 1)) : NAN;
-                }
-            double m = rs / nb;
-            out->scale_sd = sqrt(fmax(rs2 / nb - m * m, 0) * nb / (nb - 1));
-        }
-        out->n_boot = nb;
-        free(acc), free(acc2), free(bc.Sb), free(bc.ok), free(nsd), free(tau2);
+        out->scale_sd = bootstrap(&in, &e, nsd, o->boot, o->seed, gw, used, out->sd);
+        out->n_boot = o->boot;
     }
     est_free(&e);
-    free(gw), free(ebuf);
+    free(gw), free(ebuf), free(nsd);
     return PLX_OK;
 }
 

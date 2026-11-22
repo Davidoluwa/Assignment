@@ -15,8 +15,11 @@
  *   --no-controls --no-refine --no-synth   skip parts
  *   --synth-n, --synth-only the synthetic known-relief check (acceptance 1)
  *
- * Writes into <out>: w.plxt, vhr.plxt, zbar_hr.plxt, support.plxt, zscore.plxt (f32 [160, 128];
- * vhr / zbar_hr NaN outside the core), s_refined.plxt (f32 [N], when refined), mean_face.plxt,
+ * Writes into <out> (maps f32 [160, 128]): w.plxt (the warp layer exactly as fitted, units of v:
+ * render through it with plx_fl_render_relief(T, u, s, w)), vhr.plxt (v + the depth part of w,
+ * relief.h step 6) and zbar_hr.plxt (κ v_hr, px), both NaN outside the core; support.plxt (G*D);
+ * zscore.plxt (depth part / its standard error, calibrated by the permutation control);
+ * s_refined.plxt (f32 [N], when refined: render with u + (s' - s) v and s'), mean_face.plxt,
  * model/ (the sharpened template in flow-model layout: plx_fl_model_load reads it), summary.txt
  * and diag/<n>_<name>.png. */
 #include "align/canon.h"
@@ -298,7 +301,7 @@ static synth_score synth_eval(const plx_rl_synth *s, const plx_rl_result *r, con
 }
 
 static void run_synth(const plx_args *a, const plx_rl_params *p, const inputs *in, const char *diag) {
-    int n = (int)plx_arg_int(a, "synth-n", 1200), ntex = 0;
+    int n = (int)plx_arg_int(a, "synth-n", 800), ntex = 0;
     say("\n[1] SYNTHETIC KNOWN RELIEF: %d photos rendered by the z-buffer renderer from one surface (plx_synth_depth:\n"
         "    dome + nose + eye sockets + brow, lips, chin), yaw N(0, 12 deg) clipped at 35, each with a different\n"
         "    texture; the estimator gets the dome only (half-ellipsoid on the lattice), u with a smooth 0.5 px\n"
@@ -618,6 +621,15 @@ static void run_estimate(const plx_args *a, const inputs *inp, const plx_fl_mode
         say("  z = w / se (se: photo-level sandwich standard error of a regression step): rms over the core real %.2f, "
             "permuted %.2f (1 if se is calibrated); |z| > 3 on %.1f%% of core pixels (permuted %.1f%%)\n",
             rz, rzp, 100.0 * n3 / nc, 100.0 * n3p / nc);
+        /* the per-step se ignores what the iteration adds (template co-adaptation, earlier stages), so
+         * the permutation control calibrates it: z / rms(z_permuted) is the map saved and drawn */
+        int nc3 = 0;
+        for (int k = 0; k < W * H; k++) {
+            z.px[k] /= (float)rzp, zperm.px[k] /= (float)rzp;
+            if (plx_rl_in_core(p.core, k % W, k / W)) nc3 += fabsf(z.px[k]) > 3;
+        }
+        say("  calibrated z (divided by the permuted rms %.2f): rms %.2f, |z| > 3 on %.1f%% of core pixels\n", rzp,
+            rz / rzp, 100.0 * nc3 / nc);
         plx_rl_result_free(&RP);
         free(sp), free(idx), free(perm);
 
@@ -795,8 +807,8 @@ static void run_estimate(const plx_args *a, const inputs *inp, const plx_fl_mode
                 a2 = combine(&z, 1, NULL, 0, p.core, true), a3 = combine(&zperm, 1, NULL, 0, p.core, true);
         plx_img u4[4] = {cmap_tile(&a0, -m, m, PLX_CMAP_DIV), cmap_tile(&a1, -m, m, PLX_CMAP_DIV),
                          cmap_tile(&a2, -8, 8, PLX_CMAP_DIV), cmap_tile(&a3, -8, 8, PLX_CMAP_DIV)};
-        const char *l4[4] = {"kappa w (true s)", "kappa w (s permuted), same scale", "z-score (true s), +-8",
-                             "z-score (s permuted), +-8"};
+        const char *l4[4] = {"kappa w (true s)", "kappa w (s permuted), same scale", "calibrated z (true s), +-8",
+                             "calibrated z (s permuted), +-8"};
         plx_img t4[4];
         for (int k = 0; k < 4; k++) t4[k] = titled(&u4[k], l4[k]);
         plx_img im4 = stack(t4, 4, 4);
@@ -836,6 +848,7 @@ int main(int argc, char **argv) {
     if (plx_arg_str(&a, "sched", NULL)) parse_sched(plx_arg_str(&a, "sched", NULL), &p);
     p.lambda = (float)plx_arg_num(&a, "lambda", p.lambda);
     p.eta = (float)plx_arg_num(&a, "eta", p.eta);
+    p.prior_sigma = (float)plx_arg_num(&a, "prior-sigma", p.prior_sigma);
     snprintf(path, sizeof path, "%s/summary.txt", out);
     g_sum = fopen(path, "w");
     if (!g_sum) plx_die("cannot write %s", path);
