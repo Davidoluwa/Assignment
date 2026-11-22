@@ -1,0 +1,341 @@
+<title>Parallax Capture</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<style>
+/* Layout: one phone-width column of four numbered steps; the frame strip is the only
+   element allowed to scroll sideways. Accent is the two ends of the system's depth
+   colormap: "far" indigo on light ground, "near" yellow on dark ground. */
+:root {
+  --bg: #f2f4f7; --surface: #ffffff; --fg: #111a24; --muted: #5a6675; --line: #d5dbe3;
+  --accent: #3a3fb0; --accent-fg: #ffffff; --ok: #1f7a4d; --warn: #9a6200; --err: #b3261e;
+  --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0d131b; --surface: #151d28; --fg: #e8edf4; --muted: #94a1b2; --line: #2a3544;
+    --accent: #f0d64a; --accent-fg: #14181f; --ok: #5fd39a; --warn: #f0b24a; --err: #ff8a80;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0d131b; --surface: #151d28; --fg: #e8edf4; --muted: #94a1b2; --line: #2a3544;
+  --accent: #f0d64a; --accent-fg: #14181f; --ok: #5fd39a; --warn: #f0b24a; --err: #ff8a80;
+  color-scheme: dark;
+}
+body { background: var(--bg); color: var(--fg); font: 15px/1.5 var(--sans); }
+.page {
+  max-width: 34rem; margin: 0 auto; padding-block: 1.25rem 2.5rem;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+  display: flex; flex-direction: column; gap: 1rem;
+}
+h1 { font-size: 1.5rem; line-height: 1.15; letter-spacing: -0.02em; margin: 0; text-wrap: balance; }
+h2 { font-size: 1rem; margin: 0; letter-spacing: -0.01em; display: flex; align-items: baseline; gap: 0.5rem; }
+h2 .n { font: 600 0.75rem var(--mono); color: var(--accent); }
+p { margin: 0; }
+.lede { color: var(--muted); max-width: 60ch; }
+.step { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 1rem; display: flex; flex-direction: column; gap: 0.75rem; min-width: 0; }
+.poses { display: grid; grid-template-columns: repeat(5, 1fr); gap: 0.25rem; }
+.poses figure { margin: 0; display: flex; flex-direction: column; align-items: center; gap: 0.15rem; }
+.poses svg { width: 100%; max-width: 3.4rem; height: auto; }
+.poses .head { fill: none; stroke: var(--fg); stroke-width: 2; }
+.poses .mid { fill: none; stroke: var(--accent); stroke-width: 2.5; stroke-linecap: round; }
+.poses figcaption { font: 0.7rem var(--mono); color: var(--muted); text-align: center; }
+ul.tips { margin: 0; padding-left: 1.1rem; color: var(--muted); display: flex; flex-direction: column; gap: 0.2rem; }
+ul.tips b { color: var(--fg); font-weight: 600; }
+.row { display: flex; flex-wrap: wrap; gap: 0.6rem; align-items: center; }
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; min-height: 2.75rem; padding: 0 1rem;
+  border-radius: 8px; border: 1px solid var(--line); background: var(--surface); color: var(--fg);
+  font: 600 0.95rem var(--sans); cursor: pointer;
+}
+.btn.primary { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+.btn.danger { color: var(--err); }
+.btn[disabled], .btn[aria-disabled="true"] { opacity: 0.45; cursor: not-allowed; }
+.btn:focus-visible, select:focus-visible, label.btn:focus-within { outline: 2px solid var(--accent); outline-offset: 2px; }
+label.btn input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+label.btn { position: relative; }
+select { min-height: 2.5rem; padding: 0 0.5rem; border-radius: 8px; border: 1px solid var(--line); background: var(--surface); color: var(--fg); font: inherit; }
+.field { display: flex; align-items: center; gap: 0.5rem; color: var(--muted); font-size: 0.9rem; }
+.status { font-size: 0.9rem; color: var(--muted); min-height: 1.4em; }
+.status.ok { color: var(--ok); } .status.warn { color: var(--warn); } .status.err { color: var(--err); }
+.bar { height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; }
+.bar i { display: block; height: 100%; width: 0; background: var(--accent); transition: width 0.15s linear; }
+.strip { display: flex; gap: 4px; overflow-x: auto; padding-bottom: 4px; min-height: 4.5rem; align-items: center; }
+.strip img { height: 4.5rem; width: auto; max-width: none; border-radius: 4px; flex: none; background: var(--line); }
+.strip .empty { color: var(--muted); font-size: 0.9rem; }
+.meta { font: 0.8rem var(--mono); color: var(--muted); font-variant-numeric: tabular-nums; }
+.clips { display: flex; flex-direction: column; gap: 0.6rem; }
+.clip { border: 1px solid var(--line); border-radius: 8px; padding: 0.75rem; display: flex; flex-direction: column; gap: 0.5rem; min-width: 0; }
+.clip .top { display: flex; justify-content: space-between; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+.chip { font: 600 0.7rem var(--mono); letter-spacing: 0.04em; text-transform: uppercase; padding: 0.15rem 0.5rem; border-radius: 999px; border: 1px solid currentColor; }
+.chip.sent { color: var(--warn); } .chip.done { color: var(--ok); }
+.clip .result { white-space: pre-wrap; font-size: 0.9rem; overflow-wrap: anywhere; }
+.clip .shots { display: flex; flex-direction: column; gap: 0.4rem; }
+.clip .shots img { border-radius: 6px; border: 1px solid var(--line); }
+.note { color: var(--muted); font-size: 0.82rem; max-width: 60ch; }
+@media (prefers-reduced-motion: reduce) { .bar i { transition: none; } }
+</style>
+
+<main class="page">
+  <header>
+    <h1>Parallax Capture</h1>
+    <p class="lede">Record one short clip of your head turning. The page pulls still frames out of it and sends them to the Parallax pipeline, which fuses them into a single 3D shape of your face.</p>
+  </header>
+
+  <section class="step" aria-labelledby="h-move">
+    <h2 id="h-move"><span class="n">01</span> How to move</h2>
+    <div class="poses" aria-hidden="true">
+      <figure><svg viewBox="0 0 40 52"><ellipse class="head" cx="20" cy="26" rx="14" ry="20"/><path class="mid" d="M20 14 L20 36"/></svg><figcaption>straight</figcaption></figure>
+      <figure><svg viewBox="0 0 40 52"><ellipse class="head" cx="20" cy="26" rx="13" ry="20"/><path class="mid" d="M17 14 Q10 27 15 36"/></svg><figcaption>left 30&deg;</figcaption></figure>
+      <figure><svg viewBox="0 0 40 52"><ellipse class="head" cx="20" cy="26" rx="13" ry="20"/><path class="mid" d="M23 14 Q30 27 25 36"/></svg><figcaption>right 30&deg;</figcaption></figure>
+      <figure><svg viewBox="0 0 40 52"><ellipse class="head" cx="20" cy="26" rx="14" ry="19"/><path class="mid" d="M20 10 L20 30"/></svg><figcaption>up</figcaption></figure>
+      <figure><svg viewBox="0 0 40 52"><ellipse class="head" cx="20" cy="26" rx="14" ry="19"/><path class="mid" d="M20 21 L20 41"/></svg><figcaption>down</figcaption></figure>
+    </div>
+    <ul class="tips">
+      <li><b>8 to 10 seconds.</b> Start straight, turn slowly left, slowly right, back to centre, then nod up and down once.</li>
+      <li><b>Phone stays still.</b> Prop it up or hold it steady at eye level, about an arm's length away. Only your head moves.</li>
+      <li><b>Even light on your face.</b> No window behind you. Glasses off if you can; keep a neutral expression.</li>
+      <li><b>Both turns matter.</b> Left and right give depth; the nod is what lets the system measure real scale.</li>
+    </ul>
+  </section>
+
+  <section class="step" aria-labelledby="h-rec">
+    <h2 id="h-rec"><span class="n">02</span> Record</h2>
+    <div class="row">
+      <label class="btn primary">Record with camera<input id="file-cam" type="file" accept="video/*" capture="user"></label>
+      <label class="btn">Pick a video<input id="file-pick" type="file" accept="video/*"></label>
+    </div>
+    <label class="field" for="nframes">Frames to keep
+      <select id="nframes"><option value="32">32</option><option value="48" selected>48</option><option value="64">64</option></select>
+    </label>
+  </section>
+
+  <section class="step" aria-labelledby="h-check">
+    <h2 id="h-check"><span class="n">03</span> Check the frames</h2>
+    <p id="x-status" class="status" role="status">Nothing recorded yet.</p>
+    <div class="bar" aria-hidden="true"><i id="x-bar"></i></div>
+    <div id="strip" class="strip"><span class="empty">Frames appear here after you record. You should see your head turn across the strip.</span></div>
+    <p id="x-meta" class="meta"></p>
+  </section>
+
+  <section class="step" aria-labelledby="h-send">
+    <h2 id="h-send"><span class="n">04</span> Send</h2>
+    <div class="row">
+      <button id="send" class="btn primary" type="button" disabled>Send frames</button>
+      <button id="discard" class="btn" type="button" disabled>Discard</button>
+    </div>
+    <p id="s-status" class="status" role="status">Frames stay on this device until you press Send.</p>
+    <div class="bar" aria-hidden="true"><i id="s-bar"></i></div>
+  </section>
+
+  <section class="step" aria-labelledby="h-clips">
+    <h2 id="h-clips">Your clips</h2>
+    <div id="clips" class="clips"><p id="clips-empty" class="status">Loading your clips…</p></div>
+  </section>
+
+  <p class="note">Frames are stored as JPEG images with this private page only, so the pipeline can fetch them. Deleting a clip here removes its frames for good. Nothing leaves your device before you press Send.</p>
+</main>
+
+<canvas id="cv" hidden></canvas>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const MAX_SIDE = 640, JPEG_Q = 0.9;
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const state = { frames: [], meta: null, file: null, busy: false, uploaded: [], clipId: null, assets: null, db: null };
+
+  function setStatus(el, text, kind) { el.textContent = text; el.className = 'status' + (kind ? ' ' + kind : ''); }
+  function setBar(el, frac) { el.style.width = Math.round(Math.max(0, Math.min(1, frac)) * 100) + '%'; }
+  function once(target, event, ms) {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { target.removeEventListener(event, on); reject(new Error('timeout:' + event)); }, ms);
+      function on() { clearTimeout(timer); target.removeEventListener(event, on); resolve(); }
+      target.addEventListener(event, on);
+    });
+  }
+  function nextVideoFrame(v) { /* resolves when the sought picture is on screen, or after a short wait */
+    return Promise.race([
+      new Promise((r) => (v.requestVideoFrameCallback ? v.requestVideoFrameCallback(() => r()) : requestAnimationFrame(() => r()))),
+      sleep(250),
+    ]);
+  }
+  function refreshButtons() {
+    const ready = state.frames.length > 0 && !state.busy;
+    $('send').disabled = !ready || !state.assets || !state.db;
+    $('discard').disabled = !ready;
+    $('send').textContent = state.uploaded.length && state.frames.length ? 'Resume sending' : 'Send frames';
+  }
+  function clearFrames() {
+    for (const f of state.frames) URL.revokeObjectURL(f.url);
+    state.frames = []; state.meta = null; state.file = null; state.uploaded = []; state.clipId = null;
+    $('strip').replaceChildren();
+    const empty = document.createElement('span'); empty.className = 'empty';
+    empty.textContent = 'Frames appear here after you record. You should see your head turn across the strip.';
+    $('strip').append(empty);
+    $('x-meta').textContent = ''; setBar($('x-bar'), 0); setBar($('s-bar'), 0);
+  }
+  function grab(v, cv, ctx, t) {
+    ctx.drawImage(v, 0, 0, cv.width, cv.height);
+    return new Promise((resolve, reject) => cv.toBlob((b) => (b ? resolve({ blob: b, t, url: URL.createObjectURL(b) }) : reject(new Error('encode'))), 'image/jpeg', JPEG_Q));
+  }
+  function showFrame(f, i, n) {
+    const img = document.createElement('img'); img.src = f.url; img.alt = 'frame ' + (i + 1);
+    $('strip').append(img); setBar($('x-bar'), (i + 1) / n);
+  }
+
+  /* Seek to n evenly spaced times; if the device will not seek, play through once and sample. */
+  async function extract(file) {
+    state.busy = true; clearFrames(); state.file = file; refreshButtons();
+    $('strip').replaceChildren();
+    setStatus($('x-status'), 'Reading the clip…');
+    const src = URL.createObjectURL(file);
+    const v = document.createElement('video');
+    v.muted = true; v.playsInline = true; v.preload = 'auto'; v.src = src;
+    try {
+      await once(v, 'loadedmetadata', 20000);
+      if (!isFinite(v.duration)) { v.currentTime = 1e7; await once(v, 'seeked', 8000).catch(() => {}); v.currentTime = 0; await once(v, 'seeked', 8000).catch(() => {}); }
+      const dur = v.duration;
+      if (!isFinite(dur) || dur <= 0 || !v.videoWidth) throw new Error('unreadable');
+      try { await v.play(); v.pause(); } catch (_) { /* priming the decoder is best-effort */ }
+      const n = Number($('nframes').value);
+      const k = Math.min(1, MAX_SIDE / Math.max(v.videoWidth, v.videoHeight));
+      const cv = $('cv'); cv.width = Math.round(v.videoWidth * k); cv.height = Math.round(v.videoHeight * k);
+      const ctx = cv.getContext('2d');
+      let seekable = true;
+      for (let i = 0; i < n && seekable; i++) {
+        const t = ((i + 0.5) / n) * dur;
+        v.currentTime = t;
+        try { await once(v, 'seeked', 6000); } catch (_) { seekable = false; break; }
+        await nextVideoFrame(v);
+        const f = await grab(v, cv, ctx, t); state.frames.push(f); showFrame(f, i, n);
+        setStatus($('x-status'), 'Extracting frames… ' + (i + 1) + ' of ' + n);
+      }
+      if (!seekable) {
+        for (const f of state.frames) URL.revokeObjectURL(f.url);
+        state.frames = []; $('strip').replaceChildren();
+        setStatus($('x-status'), 'This device will not seek the clip; playing it through once instead…');
+        v.currentTime = 0; await once(v, 'seeked', 4000).catch(() => {});
+        let next = 0; const ended = once(v, 'ended', (dur + 15) * 1000).catch(() => {});
+        const tick = async () => {
+          while (next < n && v.currentTime >= ((next + 0.5) / n) * dur) {
+            const f = await grab(v, cv, ctx, v.currentTime); state.frames.push(f); showFrame(f, next, n); next++;
+          }
+          if (!v.ended && next < n) (v.requestVideoFrameCallback ? v.requestVideoFrameCallback(tick) : requestAnimationFrame(tick));
+        };
+        await v.play(); tick(); await ended;
+      }
+      if (state.frames.length < 8) throw new Error('too few frames');
+      state.meta = { width: cv.width, height: cv.height, duration_ms: Math.round(dur * 1000) };
+      $('x-meta').textContent = state.frames.length + ' frames · ' + cv.width + '×' + cv.height + ' px · ' + dur.toFixed(1) + ' s clip';
+      const short = dur < 5;
+      setStatus($('x-status'), short ? 'Got the frames, but the clip is only ' + dur.toFixed(1) + ' s. Longer and slower works better.' : 'Frames ready. Check that your head turns both ways, then send.', short ? 'warn' : 'ok');
+    } catch (e) {
+      for (const f of state.frames) URL.revokeObjectURL(f.url);
+      state.frames = [];
+      setStatus($('x-status'), 'Could not read that clip. Try recording again, or pick an MP4 from your gallery.', 'err');
+    } finally {
+      URL.revokeObjectURL(src); state.busy = false; refreshButtons();
+    }
+  }
+
+  async function uploadOne(blob) {
+    try { return await state.assets.upload(blob, { type: 'image/jpeg' }); }
+    catch (e) { if (e && e.code === 'store_unavailable') { await sleep(1500); return state.assets.upload(blob, { type: 'image/jpeg' }); } throw e; }
+  }
+  const SEND_ERRORS = {
+    rate_limited: 'Uploading too fast for the store. Wait a few seconds, then press Resume sending.',
+    quota_or_state: 'This page has run out of storage. Delete an old clip below, then press Resume sending.',
+    too_large: 'A frame was too large to store. Record again and keep fewer frames.',
+    not_granted: 'This view is not allowed to upload. Open the page as its owner.',
+  };
+  async function send() {
+    if (!state.frames.length || state.busy || !state.assets || !state.db) return;
+    state.busy = true; refreshButtons();
+    if (!state.clipId) state.clipId = 'c' + Date.now().toString(36);
+    const n = state.frames.length;
+    try {
+      for (let i = state.uploaded.length; i < n; i++) {
+        setStatus($('s-status'), 'Sending frame ' + (i + 1) + ' of ' + n + '…');
+        const res = await uploadOne(state.frames[i].blob);
+        state.uploaded.push({ id: res.id, t_ms: Math.round(state.frames[i].t * 1000) });
+        setBar($('s-bar'), (i + 1) / n);
+      }
+      await state.db.collection('clips').doc(state.clipId).set({
+        created: new Date().toISOString(), state: 'sent', n, width: state.meta.width, height: state.meta.height,
+        duration_ms: state.meta.duration_ms, frames: state.uploaded,
+        source: { type: state.file ? state.file.type : '', bytes: state.file ? state.file.size : 0 },
+      });
+      state.busy = false; clearFrames();
+      setStatus($('s-status'), 'Sent ' + n + ' frames. Tell Claude the clip is ready.', 'ok'); setBar($('s-bar'), 1);
+    } catch (e) {
+      state.busy = false;
+      setStatus($('s-status'), SEND_ERRORS[e && e.code] || 'Sending stopped (' + state.uploaded.length + ' of ' + n + ' stored). Press Resume sending to continue.', 'err');
+    }
+    refreshButtons();
+  }
+
+  function renderClips(docs) {
+    const box = $('clips'); box.replaceChildren();
+    if (!docs.length) {
+      const p = document.createElement('p'); p.className = 'status'; p.textContent = 'No clips yet. The first one you send appears here, and the 3D result shows up under it once it has been processed.';
+      box.append(p); return;
+    }
+    const rows = docs.map((d) => ({ id: d.id, ...d.data() })).sort((a, b) => String(b.created).localeCompare(String(a.created)));
+    for (const c of rows) {
+      const el = document.createElement('article'); el.className = 'clip';
+      const top = document.createElement('div'); top.className = 'top';
+      const when = document.createElement('span'); when.className = 'meta';
+      const date = new Date(c.created);
+      when.textContent = (isNaN(date) ? 'clip' : date.toLocaleString()) + ' · ' + (c.n || 0) + ' frames';
+      const done = c.state === 'processed';
+      const chip = document.createElement('span'); chip.className = 'chip ' + (done ? 'done' : 'sent'); chip.textContent = done ? 'processed' : 'sent';
+      top.append(when, chip); el.append(top);
+      if (c.result && typeof c.result.summary === 'string') { const r = document.createElement('p'); r.className = 'result'; r.textContent = c.result.summary; el.append(r); }
+      if (c.result && Array.isArray(c.result.images) && c.result.images.length) {
+        const shots = document.createElement('div'); shots.className = 'shots';
+        for (const id of c.result.images) if (/^[0-9a-f]{32}$/.test(id)) { const im = document.createElement('img'); im.src = '/_blob/' + id; im.alt = 'reconstruction'; im.loading = 'lazy'; shots.append(im); }
+        el.append(shots);
+      }
+      if (state.assets && state.db) {
+        const row = document.createElement('div'); row.className = 'row';
+        const del = document.createElement('button'); del.type = 'button'; del.className = 'btn danger'; del.textContent = 'Delete clip';
+        del.addEventListener('click', () => {
+          if (del.dataset.armed !== '1') { del.dataset.armed = '1'; del.textContent = 'Tap again to delete for good'; setTimeout(() => { del.dataset.armed = ''; del.textContent = 'Delete clip'; }, 4000); return; }
+          deleteClip(c, del);
+        });
+        row.append(del); el.append(row);
+      }
+      box.append(el);
+    }
+  }
+  async function deleteClip(c, btn) {
+    btn.disabled = true; btn.textContent = 'Deleting…';
+    try {
+      const ids = (c.frames || []).map((f) => f.id).concat((c.result && c.result.images) || []);
+      for (const id of ids) await state.assets.delete(id);
+      await state.db.collection('clips').doc(c.id).delete();
+    } catch (e) { btn.disabled = false; btn.textContent = 'Could not delete. Try again'; }
+  }
+
+  for (const id of ['file-cam', 'file-pick']) $(id).addEventListener('change', (ev) => { const f = ev.target.files && ev.target.files[0]; ev.target.value = ''; if (f && !state.busy) extract(f); });
+  $('send').addEventListener('click', send);
+  $('discard').addEventListener('click', () => { if (!state.busy) { clearFrames(); setStatus($('x-status'), 'Discarded. Nothing was sent.'); setStatus($('s-status'), 'Frames stay on this device until you press Send.'); refreshButtons(); } });
+
+  (async () => {
+    const api = window.claude && typeof window.claude.use === 'function' ? window.claude : null;
+    const [assets, db] = api ? await Promise.all([api.use('assets'), api.use('db')]) : [null, null];
+    state.assets = assets; state.db = db; refreshButtons();
+    if (!assets || !db) {
+      setStatus($('s-status'), 'Sending is only available when the page owner opens this inside Claude. You can still record and check frames here.', 'warn');
+      setStatus($('clips-empty'), 'Clips are listed when the page owner opens this inside Claude.');
+      return;
+    }
+    const slow = setTimeout(() => setStatus($('clips-empty'), 'Your clips cannot be reached yet. Still trying…', 'warn'), 10000);
+    db.collection('clips').onSnapshot(
+      (snap) => { if (!snap.metadata.fromCache) clearTimeout(slow); renderClips(snap.docs); },
+      () => { clearTimeout(slow); const p = document.createElement('p'); p.className = 'status err'; p.textContent = 'Your clips could not be loaded. Reopen the page to try again.'; $('clips').replaceChildren(p); },
+    );
+  })();
+})();
+</script>
