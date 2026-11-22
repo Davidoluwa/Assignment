@@ -285,14 +285,15 @@ typedef struct { double corr, corr_hp, rms, rms_true, rms_w; } synth_score;
 
 static synth_score synth_eval(const plx_rl_synth *s, const plx_rl_result *r, const plx_rl_params *p, plx_img *wt_out) {
     synth_score sc;
-    plx_img v = plx_rl_v_dense(s->v_lat), wt = plx_img_clone(&s->w_true), zero = plx_img_new(W, H, 1);
+    plx_img v = plx_rl_v_dense(s->v_lat), wt = plx_img_clone(&s->w_true), wg = plx_img_clone(&r->w);
     plx_rl_gauge(&wt, &v, &r->support, p->core, NULL);
-    plx_rl_compare(&r->w, &wt, p->core, 4.0f, &sc.corr, &sc.corr_hp, &sc.rms);
+    plx_rl_gauge(&wg, &v, &r->support, p->core, NULL);
+    plx_rl_compare(&wg, &wt, p->core, 4.0f, &sc.corr, &sc.corr_hp, &sc.rms);
     sc.rms_true = rms_core(&wt, p->core);
-    sc.rms_w = rms_core(&r->w, p->core);
+    sc.rms_w = rms_core(&wg, p->core);
     if (wt_out) *wt_out = wt;
     else plx_img_free(&wt);
-    plx_img_free(&v), plx_img_free(&zero);
+    plx_img_free(&v), plx_img_free(&wg);
     return sc;
 }
 
@@ -469,10 +470,21 @@ static void iter_table(const plx_rl_result *r, double kappa) {
         "   is the population rendered with the w of pass k - 1)\n");
 }
 
+/* The depth part of a warp layer: w with span{1, Y0, v} removed over the core, weights `support`
+ * (relief.h step 6). The removed parts are not depth: α + γ Y0 is a translation / shear of every
+ * photo proportional to its yaw, c v a rescaling of s along the lattice pattern. */
+static plx_img gauged(const plx_img *w, const plx_img *v, const plx_img *support, plx_core_shape cs, double coef[3]) {
+    plx_img g = plx_img_clone(w);
+    plx_rl_gauge(&g, v, support, cs, coef);
+    return g;
+}
+
 typedef struct { double corr, corr_hp, rms; } agreement;
 
+/* Both halves from w = 0; their depth parts (gauged with the common weights `support`) compared. */
 static agreement split_half(const inputs *in, const plx_rl_params *p, const plx_cg_template *init, const uint8_t *side,
-                            const float *s, const float *shift, plx_img *wa, plx_img *wb, int *na, int *nb) {
+                            const float *s, const float *shift, const plx_img *v, const plx_img *support, plx_img *wa,
+                            plx_img *wb, int *na, int *nb) {
     uint8_t *ua = PLX_NEW(uint8_t, in->n), *ub = PLX_NEW(uint8_t, in->n);
     *na = *nb = 0;
     for (int i = 0; i < in->n; i++) {
@@ -484,8 +496,8 @@ static agreement split_half(const inputs *in, const plx_rl_params *p, const plx_
     plx_rl_estimate(&da, p, init, NULL, false, &A);
     plx_rl_estimate(&db, p, init, NULL, false, &B);
     agreement g;
-    plx_rl_compare(&A.w, &B.w, p->core, 4.0f, &g.corr, &g.corr_hp, &g.rms);
-    *wa = plx_img_clone(&A.w), *wb = plx_img_clone(&B.w);
+    *wa = gauged(&A.w, v, support, p->core, NULL), *wb = gauged(&B.w, v, support, p->core, NULL);
+    plx_rl_compare(wa, wb, p->core, 4.0f, &g.corr, &g.corr_hp, &g.rms);
     plx_rl_result_free(&A), plx_rl_result_free(&B);
     free(ua), free(ub);
     return g;
@@ -565,15 +577,18 @@ static void run_estimate(const plx_args *a, const inputs *inp, const plx_fl_mode
     say("\nESTIMATE (%.0f s): starts from w = 0 against the flow model's template\n", plx_now() - t0);
     iter_table(&R, kap);
     plx_img v = plx_rl_v_dense(in.v_lat);
-    double wmax = 0;
+    double gc[3], wmax = 0;
+    plx_img wg = gauged(&R.w, &v, &R.support, p.core, gc);
     for (int k = 0; k < W * H; k++)
-        if (plx_rl_in_core(p.core, k % W, k / W)) wmax = fmax(wmax, fabs(kap * R.w.px[k]));
-    say("  w over the core: rms %.3f px of depth (kappa w), max |kappa w| %.2f px; the dome kappa v has rms %.3f px\n",
-        kap * rms_core(&R.w, p.core), wmax, kap * rms_core(&v, p.core));
+        if (plx_rl_in_core(p.core, k % W, k / W)) wmax = fmax(wmax, fabs(kap * wg.px[k]));
+    say("  depth part of w (gauged, step 6) over the core: rms %.3f px (kappa w), max %.2f px; the dome kappa v: rms "
+        "%.3f px\n  removed by the gauge: alpha %+.3f px, gamma %+.5f px/px (a yaw-proportional translation / shear), "
+        "c %+.4f (w along v: the fine regression asks for %.1f%% more depth along the dome than emerge's kappa v)\n",
+        kap * rms_core(&wg, p.core), wmax, kap * rms_core(&v, p.core), kap * gc[0], kap * gc[1], gc[2], 100 * gc[2]);
 
     /* ---- controls ---- */
     plx_img wperm = {0}, zperm = {0}, z = plx_img_new(W, H, 1), wsp[4] = {{0}};
-    for (int k = 0; k < W * H; k++) z.px[k] = R.se.px[k] > 0 ? R.w.px[k] / R.se.px[k] : 0;
+    for (int k = 0; k < W * H; k++) z.px[k] = R.se.px[k] > 0 ? wg.px[k] / R.se.px[k] : 0;
     agreement ag[2] = {{0}};
     if (!plx_arg_flag(a, "no-controls")) {
         say("\n[2] PERMUTATION CONTROL: s shuffled across the trusted photos (same schedule, same everything else)\n");
@@ -591,15 +606,15 @@ static void run_estimate(const plx_args *a, const inputs *inp, const plx_fl_mode
         plx_rl_data dp = as_data(&in, sp, NULL, NULL);
         plx_rl_result RP;
         plx_rl_estimate(&dp, &p, &model.tmpl, NULL, false, &RP);
-        wperm = plx_img_clone(&RP.w);
+        wperm = gauged(&RP.w, &v, &R.support, p.core, NULL);
         zperm = plx_img_new(W, H, 1);
-        for (int k = 0; k < W * H; k++) zperm.px[k] = RP.se.px[k] > 0 ? RP.w.px[k] / RP.se.px[k] : 0;
+        for (int k = 0; k < W * H; k++) zperm.px[k] = RP.se.px[k] > 0 ? wperm.px[k] / RP.se.px[k] : 0;
         double rz = rms_core(&z, p.core), rzp = rms_core(&zperm, p.core);
         int n3 = 0, n3p = 0, nc = 0;
         for (int k = 0; k < W * H; k++)
             if (plx_rl_in_core(p.core, k % W, k / W)) nc++, n3 += fabsf(z.px[k]) > 3, n3p += fabsf(zperm.px[k]) > 3;
-        say("  rms kappa w over the core: real %.3f px, permuted %.3f px (ratio %.1f)\n", kap * rms_core(&R.w, p.core),
-            kap * rms_core(&RP.w, p.core), rms_core(&R.w, p.core) / rms_core(&RP.w, p.core));
+        say("  rms kappa w (depth part) over the core: real %.3f px, permuted %.3f px (ratio %.1f)\n",
+            kap * rms_core(&wg, p.core), kap * rms_core(&wperm, p.core), rms_core(&wg, p.core) / rms_core(&wperm, p.core));
         say("  z = w / se (se: photo-level sandwich standard error of a regression step): rms over the core real %.2f, "
             "permuted %.2f (1 if se is calibrated); |z| > 3 on %.1f%% of core pixels (permuted %.1f%%)\n",
             rz, rzp, 100.0 * n3 / nc, 100.0 * n3p / nc);
@@ -623,7 +638,8 @@ static void run_estimate(const plx_args *a, const inputs *inp, const plx_fl_mode
                 free(is);
             }
             int na, nb;
-            ag[split] = split_half(&in, &p, &model.tmpl, side, NULL, NULL, &wsp[2 * split], &wsp[2 * split + 1], &na, &nb);
+            ag[split] = split_half(&in, &p, &model.tmpl, side, NULL, NULL, &v, &R.support, &wsp[2 * split],
+                                   &wsp[2 * split + 1], &na, &nb);
             say("  %-12s %5d / %5d photos: corr %.4f, high-pass corr %.4f, rms difference %.3f px (kappa w)\n",
                 split ? "by identity" : "random", na, nb, ag[split].corr, ag[split].corr_hp, kap * ag[split].rms);
         }
@@ -638,13 +654,19 @@ static void run_estimate(const plx_args *a, const inputs *inp, const plx_fl_mode
         float *ds = PLX_NEW(float, in.n), *shift = PLX_NEW(float, in.n);
         s_ref = PLX_NEW(float, in.n);
         plx_rl_refine_yaw(&d, &p, &R.tmpl, &R.w, 0, ds);
-        double s2 = 0, d2 = 0, r2 = 0;
+        /* the gauge in s: a common rescaling of all s would trade against the depth scale (κ), so
+         * the component of the steps along s itself is removed */
+        double s2 = 0, sd = 0, d2 = 0, r2 = 0;
+        for (int i = 0; i < in.n; i++)
+            if (in.use[i]) s2 += (double)in.s[i] * in.s[i], sd += (double)in.s[i] * ds[i];
+        double gs = eta_s * sd / s2;
         for (int i = 0; i < in.n; i++) {
-            shift[i] = in.use[i] ? (float)(eta_s * ds[i]) : 0.0f;
+            shift[i] = in.use[i] ? (float)(eta_s * ds[i] - gs * in.s[i]) : 0.0f;
             s_ref[i] = in.s[i] + shift[i];
-            if (in.use[i]) s2 += (double)in.s[i] * in.s[i], d2 += (double)shift[i] * shift[i], r2 += (double)s_ref[i] * s_ref[i];
+            if (in.use[i]) d2 += (double)shift[i] * shift[i], r2 += (double)s_ref[i] * s_ref[i];
         }
-        say("\n[8] YAW REFINEMENT: one Gauss-Newton step per photo against the sharpened model, damped %.2f\n", eta_s);
+        say("\n[8] YAW REFINEMENT: one Gauss-Newton step per photo against the sharpened model, damped %.2f; the common\n"
+            "    rescaling of s in the steps (%+.2f%%) is removed (scale gauge)\n", eta_s, 100 * gs);
         say("  rms s %.4f px; rms change %.4f px (%.1f%% of rms s); corr(s, s') %.4f; rms s' / rms s %.4f\n", sqrt(s2 / nu),
             sqrt(d2 / nu), 100 * sqrt(d2 / s2), corr_f(in.s, s_ref, in.use, in.n), sqrt(r2 / s2));
         plx_rl_params pr = p;
@@ -655,7 +677,9 @@ static void run_estimate(const plx_args *a, const inputs *inp, const plx_fl_mode
         plx_rl_estimate(&d2d, &pr, &R.tmpl, &R.w, true, &R2);
         iter_table(&R2, kap);
         double c, ch, rr;
-        plx_rl_compare(&R2.w, &R.w, p.core, 4.0f, &c, &ch, &rr);
+        plx_img w2g = gauged(&R2.w, &v, &R.support, p.core, NULL);
+        plx_rl_compare(&w2g, &wg, p.core, 4.0f, &c, &ch, &rr);
+        plx_img_free(&w2g);
         say("  w after refinement vs before: corr %.4f (high-pass %.4f), rms difference %.3f px; sharpness %.3f -> %.3f\n",
             c, ch, kap * rr, R.sharpness, R2.sharpness);
         if (!plx_arg_flag(a, "no-controls")) {
@@ -665,7 +689,7 @@ static void run_estimate(const plx_args *a, const inputs *inp, const plx_fl_mode
             for (int i = 0; i < in.n; i++) side[i] = (uint8_t)plx_rng_below(&rng, 2);
             plx_img wa, wb;
             int na, nb;
-            agreement g = split_half(&in, &p, &model.tmpl, side, s_ref, shift, &wa, &wb, &na, &nb);
+            agreement g = split_half(&in, &p, &model.tmpl, side, s_ref, shift, &v, &R.support, &wa, &wb, &na, &nb);
             say("  random split-half with the refined s (same halves, full schedule): corr %.4f, high-pass %.4f, rms diff "
                 "%.3f px (before refinement: %.4f, %.4f, %.3f)\n", g.corr, g.corr_hp, kap * g.rms, ag[0].corr,
                 ag[0].corr_hp, kap * ag[0].rms);
@@ -677,16 +701,20 @@ static void run_estimate(const plx_args *a, const inputs *inp, const plx_fl_mode
         free(ds), free(shift);
     }
     const plx_rl_result *F = s_ref ? &R2 : &R; /* the final model */
+    double fc[3];
+    plx_img wF = gauged(&F->w, &v, &F->support, p.core, fc);
+    if (s_ref)
+        say("  final gauge: alpha %+.3f px, gamma %+.5f, c %+.4f\n", kap * fc[0], kap * fc[1], fc[2]);
 
     /* ---- shape and sharpness ---- */
-    plx_img zb = combine(&v, kap, NULL, 0, p.core, false), za = combine(&v, kap, &F->w, kap, p.core, false);
+    plx_img zb = combine(&v, kap, NULL, 0, p.core, false), za = combine(&v, kap, &wF, kap, p.core, false);
     plx_img prof = shape_report(&zb, &za, &F->mean_gray, p.core);
     say("\n[5] SHARPNESS (same definitions as the flow summary; before = the population rendered at w = 0)\n");
     say("  mean face sharpness %.3f -> %.3f; core feature variance %.2f -> %.2f (var/2nd moment %.4f -> %.4f)\n",
         R.iter[0].sharpness, F->sharpness, R.iter[0].core_var, F->core_var, R.iter[0].core_ratio, F->core_ratio);
 
     /* ---- outputs ---- */
-    plx_img vhr = combine(&v, 1, &F->w, 1, p.core, true), zhr = combine(&v, kap, &F->w, kap, p.core, true);
+    plx_img vhr = combine(&v, 1, &wF, 1, p.core, true), zhr = combine(&v, kap, &wF, kap, p.core, true);
     save_map(out, "w.plxt", &F->w);
     save_map(out, "vhr.plxt", &vhr);
     save_map(out, "zbar_hr.plxt", &zhr);
@@ -700,7 +728,7 @@ static void run_estimate(const plx_args *a, const inputs *inp, const plx_fl_mode
 
     /* ---- pictures ---- */
     {
-        plx_img zbm = combine(&v, kap, NULL, 0, p.core, true), wk = combine(&F->w, kap, NULL, 0, p.core, true),
+        plx_img zbm = combine(&v, kap, NULL, 0, p.core, true), wk = combine(&wF, kap, NULL, 0, p.core, true),
                 sp = combine(&F->support, 1, NULL, 0, p.core, false);
         float lo, hi, m = 0;
         plx_viz_auto_range(zhr.px, (size_t)W * H, 0.0f, 1.0f, &lo, &hi);
@@ -735,7 +763,7 @@ static void run_estimate(const plx_args *a, const inputs *inp, const plx_fl_mode
     if (wperm.w) {
         float m = 0;
         for (int k = 0; k < W * H; k++)
-            if (plx_rl_in_core(p.core, k % W, k / W)) m = fmaxf(m, (float)fabs(kap * R.w.px[k]));
+            if (plx_rl_in_core(p.core, k % W, k / W)) m = fmaxf(m, (float)fabs(kap * wg.px[k]));
         const char *lab[8] = {"random half A", "random half B", "identity half A", "identity half B",
                               "high-pass A", "high-pass B", "high-pass id A", "high-pass id B"};
         plx_img t[8];
@@ -763,7 +791,7 @@ static void run_estimate(const plx_args *a, const inputs *inp, const plx_fl_mode
         save_png(diag, "4_split_half.png", &im);
         for (int k = 0; k < nt; k++) plx_img_free(&t[k]);
         plx_img_free(&im);
-        plx_img a0 = combine(&R.w, kap, NULL, 0, p.core, true), a1 = combine(&wperm, kap, NULL, 0, p.core, true),
+        plx_img a0 = combine(&wg, kap, NULL, 0, p.core, true), a1 = combine(&wperm, kap, NULL, 0, p.core, true),
                 a2 = combine(&z, 1, NULL, 0, p.core, true), a3 = combine(&zperm, 1, NULL, 0, p.core, true);
         plx_img u4[4] = {cmap_tile(&a0, -m, m, PLX_CMAP_DIV), cmap_tile(&a1, -m, m, PLX_CMAP_DIV),
                          cmap_tile(&a2, -8, 8, PLX_CMAP_DIV), cmap_tile(&a3, -8, 8, PLX_CMAP_DIV)};
@@ -787,7 +815,7 @@ static void run_estimate(const plx_args *a, const inputs *inp, const plx_fl_mode
         plx_img_free(&t[0]), plx_img_free(&t[1]), plx_img_free(&f0), plx_img_free(&f1), plx_img_free(&im);
     }
     for (int k = 0; k < 4; k++) plx_img_free(&wsp[k]);
-    plx_img_free(&wperm), plx_img_free(&zperm), plx_img_free(&z), plx_img_free(&v);
+    plx_img_free(&wperm), plx_img_free(&zperm), plx_img_free(&z), plx_img_free(&v), plx_img_free(&wg), plx_img_free(&wF);
     plx_img_free(&zb), plx_img_free(&za), plx_img_free(&prof), plx_img_free(&vhr), plx_img_free(&zhr);
     plx_rl_result_free(&R), plx_rl_result_free(&R2);
     free(s_ref);

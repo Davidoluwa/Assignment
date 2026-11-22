@@ -1,4 +1,4 @@
-// plx-deps: rec align eval data la feat ops img core
+// plx-deps: rec align render eval data la feat ops viz img core
 #include "test.h"
 
 #include "core/core.h"
@@ -159,6 +159,35 @@ TEST(flow_texture_and_jacobian) {
     plx_img_free(&t1);
     plx_img_free(&c1);
     plx_img_free(&jd);
+}
+
+TEST(visibility_from_depth) {
+    const int W = PLX_REC_TEX_W, H = PLX_REC_TEX_H;
+    plx_img z = plx_img_new(W, H, 1), conf = plx_img_new(W, H, 1);
+    /* a roof: z = 40 - 0.5 |x - 63.5| (both slopes face the viewer at 26.6 degrees) */
+    for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++) PLX_PX(&z, x, y, 0) = (float)(40.0 - 0.5 * fabs(x - 63.5));
+    const double yaw = 20.0 * 3.14159265358979 / 180.0;
+    plx_img_fill(&conf, 1.0f);
+    plx_rec_visibility(&z, yaw, 0.0, 1.0f, false, &conf);
+    /* normals (-/+0.5, 0, 1)/|.|: the image-right slope (x > 63.5) turns away under positive yaw */
+    double nn = sqrt(1.25), right = (-sin(yaw) * 0.5 + cos(yaw)) / nn, left = (sin(yaw) * 0.5 + cos(yaw)) / nn;
+    CHECK_NEAR(PLX_PX(&conf, 100, 80, 0), right, 1e-4);
+    CHECK_NEAR(PLX_PX(&conf, 20, 80, 0), left, 1e-4);
+    plx_img_fill(&conf, 1.0f);
+    plx_rec_visibility(&z, yaw, 0.0, 1.0f, true, &conf); /* relative to frontal; the near side caps at 1 */
+    CHECK_NEAR(PLX_PX(&conf, 100, 80, 0), right / (1 / nn), 1e-4);
+    CHECK_NEAR(PLX_PX(&conf, 20, 80, 0), 1.0, 1e-6);
+    /* a tall ridge at x = 70..72 hides the strip just behind it (image-right) when turned right */
+    for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++) PLX_PX(&z, x, y, 0) = x >= 70 && x <= 72 ? 60.0f : 0.0f;
+    plx_img_fill(&conf, 1.0f);
+    plx_rec_visibility(&z, yaw, 0.0, 1.0f, true, &conf);
+    CHECK(PLX_PX(&conf, 80, 80, 0) == 0.0f);  /* 60 px high ridge, tan(20) * 60 = 22 px shadow */
+    CHECK_NEAR(PLX_PX(&conf, 100, 80, 0), cos(yaw), 1e-5); /* beyond the shadow: flat, foreshortened */
+    CHECK_NEAR(PLX_PX(&conf, 50, 80, 0), cos(yaw), 1e-5);  /* in front of the ridge */
+    plx_img_free(&z);
+    plx_img_free(&conf);
 }
 
 /* ---- photometric / descriptor invariances -------------------------------------------- */
@@ -581,6 +610,7 @@ int main(void) {
     RUN(sim_affine_hand_points);
     RUN(identity_texture_is_centre_crop);
     RUN(flow_texture_and_jacobian);
+    RUN(visibility_from_depth);
     RUN(photometric_invariances);
     RUN(descriptor_photometric_invariance);
     RUN(descriptor_weights);

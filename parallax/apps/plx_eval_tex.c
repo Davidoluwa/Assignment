@@ -1,4 +1,4 @@
-// plx-deps: rec align eval data la feat ops viz img core
+// plx-deps: rec align render eval data la feat ops viz img core
 /* plx_eval_tex: texture-descriptor face verification on LFW (ablation rungs L0 / L1).
  *
  *   plx_eval_tex --pack runs/main/pack [--sim runs/main/congeal/sim.plxt | --flow runs/main/flow]
@@ -13,7 +13,10 @@
  *   instead, i.e. only pose-driven asymmetric stretch), --fallback BITS (images whose flow quality
  *   flags intersect BITS use alpha = 0), --conf FILE (f32 [N, 160, 128] confidence planes from
  *   outside, multiplied in: the seam for depth-derived visibility), --codes FILE (f32 [N, K]
- *   non-texture codes appended to every descriptor as one more block: the seam for geometry codes).
+ *   non-texture codes appended to every descriptor as one more block: the seam for geometry codes),
+ *   --pose FILE (geom pose.plxt) with --vis P: confidence *= visibility of the canonical surface
+ *   --depth FILE (default runs/main/geom/zbar_dense.plxt) under the photo's yaw and pitch, ^P
+ *   (plx_rec_visibility; --vis-abs: absolute normal cosine, --vis-yaw-only: pitch taken as 0).
  * Writes into <out>:
  *   desc.plxt, cellw.plxt, desc.cfg   descriptor cache [N, D] / [N, cells] (reused when desc.cfg matches)
  *   report.txt                        configuration + plx_verif_print blocks: View 1 (and View 2
@@ -123,7 +126,14 @@ typedef struct {
     float *codes;          /* optional f32 [N, code_dim] non-texture codes appended as one block */
     int code_dim;
     const char *codes_path;
+    float *pose;           /* optional f32 [N, 9] geometry pose (geom/pose.plxt), for visibility */
+    plx_img depth;         /* canonical depth map for visibility (zbar_dense.plxt layout) */
+    const char *pose_path, *depth_path;
 } dataset;
+
+enum { POSE_COLS = 9, POSE_YAW = 2, POSE_PITCH = 3, POSE_FLAGS = 8 };
+/* geom pose flags: 1 untrusted by flow quality, 2 rank-1 outlier: the pose estimate is not used */
+enum { POSE_UNTRUSTED = 1 | 2 };
 
 /* How a texture is made from the data: everything per-configuration (ablation rows differ). */
 typedef struct {
@@ -131,11 +141,16 @@ typedef struct {
     float jpow;      /* > 0: confidence *= clamp(det(I + alpha grad u), 0, 1)^jpow */
     int   fallback;  /* images whose flow quality flags intersect this mask use alpha = 0 */
     bool  jmirror;   /* stretch relative to the mirror partner (pose only, not face width) */
+    float vpow;      /* > 0: confidence *= visibility of the 3D surface under the photo's pose ^ vpow */
+    bool  vabs;      /* absolute normal cosine instead of foreshortening relative to frontal */
+    bool  vyaw;      /* yaw only (pitch set to 0: the pitch estimate is weak) */
 } tex_opts;
 
 static tex_opts tex_from_args(const plx_args *a) {
     return (tex_opts){.alpha = (float)plx_arg_num(a, "alpha", 1.0), .jpow = (float)plx_arg_num(a, "jconf", 0.0),
-                      .fallback = (int)plx_arg_int(a, "fallback", 0), .jmirror = plx_arg_flag(a, "jconf-mirror")};
+                      .fallback = (int)plx_arg_int(a, "fallback", 0), .jmirror = plx_arg_flag(a, "jconf-mirror"),
+                      .vpow = (float)plx_arg_num(a, "vis", 0.0), .vabs = plx_arg_flag(a, "vis-abs"),
+                      .vyaw = plx_arg_flag(a, "vis-yaw-only")};
 }
 
 static float *load_f32(const char *path, int64_t rows, int64_t cols, int64_t *cols_out) {
@@ -195,6 +210,18 @@ static void dataset_open(dataset *ds, const plx_args *a) {
             ds->conf.dim[1] != PLX_REC_TEX_H || ds->conf.dim[2] != PLX_REC_TEX_W)
             plx_die("%s: expected f32 [%d, %d, %d]", ds->conf_path, n, PLX_REC_TEX_H, PLX_REC_TEX_W);
     }
+    ds->pose_path = plx_arg_str(a, "pose", NULL);
+    if (ds->pose_path) {
+        ds->pose = load_f32(ds->pose_path, n, POSE_COLS, NULL);
+        ds->depth_path = plx_arg_str(a, "depth", "runs/main/geom/zbar_dense.plxt");
+        plx_tensor t;
+        if (plx_tensor_load(ds->depth_path, &t) != PLX_OK) plx_die("cannot load %s", ds->depth_path);
+        if (t.dtype != PLX_F32 || t.ndim != 2 || t.dim[0] != PLX_REC_TEX_H || t.dim[1] != PLX_REC_TEX_W)
+            plx_die("%s: expected f32 [%d, %d]", ds->depth_path, PLX_REC_TEX_H, PLX_REC_TEX_W);
+        ds->depth = plx_img_new(PLX_REC_TEX_W, PLX_REC_TEX_H, 1);
+        memcpy(ds->depth.px, t.data, t.nbytes);
+        plx_tensor_free(&t);
+    }
     ds->codes_path = plx_arg_str(a, "codes", NULL);
     if (ds->codes_path) {
         int64_t dim;
@@ -213,6 +240,8 @@ static void dataset_close(dataset *ds) {
     free(ds->u);
     free(ds->qflags);
     free(ds->codes);
+    free(ds->pose);
+    plx_img_free(&ds->depth);
     plx_lfw_free(&ds->db);
 }
 
@@ -236,6 +265,12 @@ static void texture_of(const dataset *ds, const tex_opts *to, int i, plx_img *te
         }
     } else {
         plx_rec_texture_sim(&im, sim, tex, conf);
+    }
+    if (to->vpow > 0.0f) {
+        if (!ds->pose) plx_die("--vis needs --pose (and --depth)");
+        const float *ps = ds->pose + (size_t)i * POSE_COLS;
+        if (!((int)ps[POSE_FLAGS] & POSE_UNTRUSTED))
+            plx_rec_visibility(&ds->depth, ps[POSE_YAW], to->vyaw ? 0.0 : ps[POSE_PITCH], to->vpow, !to->vabs, conf);
     }
     if (ds->conf_path) {
         const float *c = (const float *)ds->conf.data + (size_t)i * PLX_REC_TEX_W * PLX_REC_TEX_H;
@@ -283,6 +318,9 @@ static void cache_key(const dataset *ds, const plx_desc_params *p, const tex_opt
     if (ds->flow_dir && at > 0 && (size_t)at < cap)
         at += snprintf(buf + at, cap - (size_t)at, " flow=%s alpha=%g jconf=%g%s fallback=%d", ds->flow_dir, to->alpha,
                        to->jpow, to->jmirror ? "(mirror ratio)" : "", to->fallback);
+    if (to->vpow > 0.0f && at > 0 && (size_t)at < cap)
+        at += snprintf(buf + at, cap - (size_t)at, " vis=%g%s%s pose=%s depth=%s", to->vpow, to->vabs ? "(abs)" : "",
+                       to->vyaw ? "(yaw only)" : "", ds->pose_path, ds->depth_path);
     if (ds->conf_path && at > 0 && (size_t)at < cap) at += snprintf(buf + at, cap - (size_t)at, " conf=%s", ds->conf_path);
     if (ds->codes_path && at > 0 && (size_t)at < cap) at += snprintf(buf + at, cap - (size_t)at, " codes=%s", ds->codes_path);
     if (at > 0 && (size_t)at < cap) snprintf(buf + at, cap - (size_t)at, "\n");

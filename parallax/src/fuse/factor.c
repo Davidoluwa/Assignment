@@ -125,7 +125,8 @@ int plx_fu_als(int F, int P, const double *x, const double *w, int iters, double
     int k = PLX_MIN(2 * F, P);
     plx_mat U = plx_mat_new(2 * F, k), V = plx_mat_new(P, k);
     double *sv = PLX_NEW(double, k);
-    if (plx_svd(&A, &U, sv, &V) != PLX_OK) plx_die("fuse: SVD of the track matrix failed");
+    int st = plx_svd(&A, &U, sv, &V);
+    if (st != PLX_OK) plx_die("fuse: SVD of the track matrix failed: %s", plx_la_status_str(st));
     for (int i = 0; i < 2 * F; i++)
         for (int j = 0; j < 3; j++) M[i * 3 + j] = j < k ? PLX_M(&U, i, j) * sqrt(sv[j]) : 0;
     for (int j = 0; j < 3; j++)
@@ -689,7 +690,8 @@ int plx_fu_factorise(const plx_fu_tracks *tr, const plx_fu_factor_opts *o, plx_f
                 double r = residual(tr->x, F, P, &e, f, n) / (o->robust_k * fmax(sigma, 1e-9));
                 double wk = tr->w[k] / (1 + r * r);
                 if (o->nonrigid_k > 0 && med_rms > 0) {
-                    double q = nrms[n] / (o->nonrigid_k * med_rms);
+                    /* a node with no weight left last round has no residual: it stays out */
+                    double q = isfinite(nrms[n]) ? nrms[n] / (o->nonrigid_k * med_rms) : INFINITY;
                     wk /= 1 + q * q;
                 }
                 if (grid && o->visibility) wk *= vis[k];

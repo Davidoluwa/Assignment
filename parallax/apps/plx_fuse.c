@@ -278,7 +278,7 @@ static void run_clip(const context *cx, const plx_img *frames, int F, const doub
         for (size_t k = 0; k < (size_t)F * 2 * P; k++) bad += !isfinite(c->x[k]) || !isfinite(c->x_pop[k]);
         for (size_t k = 0; k < (size_t)F * P; k++) badw += !isfinite(c->w[k]);
         plx_log("DEBUG loc T %g %g %g %g cost %g; bad x %d bad w %d; T_pop0 %g %g %g %g", c->loc.T.a, c->loc.T.b, c->loc.T.tx,
-                c->loc.T.ty, c->loc.cost, bad, badw, c->tr.T_pop[0].a, c->tr.T_pop[0].b, c->tr.T_pop[0].tx, c->tr.T_pop[0].ty);
+                c->loc.T.ty, c->loc.score, bad, badw, c->tr.T_pop[0].a, c->tr.T_pop[0].b, c->tr.T_pop[0].tx, c->tr.T_pop[0].ty);
     }
     plx_fu_tracks tp = tracks_of(c, c->x), tq = tracks_of(c, c->x_pop);
     if (plx_fu_factorise(&tp, &cx->fopt, &c->sh) != PLX_OK) plx_die("factorisation failed (personal tracks)");
@@ -612,8 +612,8 @@ static void report_clip(const clip_run *c) {
     const plx_fu_shape *s = &c->sh, *q = &c->sh_pop;
     int nu = 0;
     for (int n = 0; n < c->nd.P; n++) nu += s->used[n];
-    say("  window s %.3f at (%.1f, %.1f); locate cost %.3f (runner-up elsewhere %.3f)\n", c->win.s, c->win.x0, c->win.y0,
-        c->loc.cost, c->loc.runner_cost);
+    say("  window s %.3f at (%.1f, %.1f); locate score %.3f (runner-up elsewhere %.3f)\n", c->win.s, c->win.x0,
+        c->win.y0, c->loc.score, c->loc.runner_score);
     say("  tracking cost vs the final personal template: population warps %.3f -> personal warps %.3f "
         "(population fit vs its own template %.3f); drift removed per round:",
         mean_of(c->tr.cost_pp, c->F), mean_of(c->tr.cost, c->F), mean_of(c->tr.cost_pop, c->F));
@@ -1090,8 +1090,8 @@ static int run_synth_mode(const plx_args *a) {
         snprintf(dn, sizeof dn, "clutter%d_diag.png", k);
         c = synth_clip(&se, &heads[k], k, &o, &ev, dn);
         eval_line(lab, &ev, &c);
-        say("    localisation: centre error %.2f px, scale ratio %.3f, cost %.3f vs runner-up %.3f\n", ev.loc_err,
-            ev.loc_scale, c.loc.cost, c.loc.runner_cost);
+        say("    localisation: centre error %.2f px, scale ratio %.3f, score %.3f vs runner-up %.3f\n", ev.loc_err,
+            ev.loc_scale, c.loc.score, c.loc.runner_score);
         free_clip(&c);
     }
 done:

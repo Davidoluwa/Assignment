@@ -54,6 +54,16 @@ void plx_rec_conf_from_jdet(const plx_img *jdet, float power, plx_img *conf);
  * (pose) part: below 1 on the far side of a turned face, above 1 on the near side. */
 void plx_rec_jdet_mirror_ratio(plx_img *jdet);
 
+/* Visibility from the 3D model (rung L3). z: canonical depth map (PLX_REC_TEX_W x PLX_REC_TEX_H,
+ * px, towards the viewer, NaN where the model has no surface; geom's zbar_dense.plxt layout). The
+ * surface (x, y, z(x, y)) is rotated by R = Rx(pitch) Ry(yaw) (DESIGN.md section 2, render.h) and
+ * every pixel's factor is max(0, n' . view)^power, n' the rotated unit normal, with relative =
+ * true dividing by the frontal value n_z (so only the foreshortening the pose adds counts, not the
+ * surface's slope as seen head-on); 0 where a z-buffer render of the rotated surface shows another
+ * part of the face in front of it (self-occlusion). Pixels outside the depth support take the
+ * factor of the nearest supported pixel in their row. conf is multiplied in place. */
+void plx_rec_visibility(const plx_img *z, double yaw, double pitch, float power, bool relative, plx_img *conf);
+
 /* ---- photometric normalisation (Tan & Triggs chain) -----------------------------------
  *   1. gamma:  v <- max(v, 0)^gamma              (gamma <= 0 or == 1: skipped)
  *   2. DoG:    v <- blur(v, s0) - blur(v, s1)     (s1 <= 0: skipped; s0 <= 0 means no inner blur)
