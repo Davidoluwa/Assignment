@@ -140,6 +140,11 @@ TEST(flow_texture_and_jacobian) {
     }
     CHECK_NEAR(jmin, want, 1e-4);
     CHECK_NEAR(jmax, want, 1e-4);
+    /* an affine field stretches both mirror halves alike: no pose-driven asymmetry */
+    plx_img jr = plx_img_clone(&jd);
+    plx_rec_jdet_mirror_ratio(&jr);
+    CHECK(fabsf(jr.px[0] - 1.0f) < 1e-4f && fabsf(jr.px[jr.w * jr.h - 1] - 1.0f) < 1e-4f);
+    plx_img_free(&jr);
     /* confidence: stretch (det < 1) lowers it, compression (det > 1) does not raise it */
     plx_img_fill(&c1, 1.0f);
     plx_rec_conf_from_jdet(&jd, 2.0f, &c1);

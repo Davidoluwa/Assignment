@@ -91,3 +91,12 @@ void plx_rec_conf_from_jdet(const plx_img *jdet, float power, plx_img *conf) {
         conf->px[i] *= power == 1.0f ? j : powf(j, power);
     }
 }
+
+void plx_rec_jdet_mirror_ratio(plx_img *jdet) {
+    PLX_ASSERT(jdet->w == PLX_REC_TEX_W && jdet->h == PLX_REC_TEX_H && jdet->c == 1);
+    plx_img f = plx_img_new(jdet->w, jdet->h, 1);
+    plx_flip_h(jdet, &f);
+    for (size_t i = 0; i < (size_t)jdet->w * jdet->h; i++)
+        jdet->px[i] = f.px[i] > 0.0f ? jdet->px[i] / f.px[i] : 0.0f;
+    plx_img_free(&f);
+}

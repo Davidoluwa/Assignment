@@ -9,7 +9,8 @@
  * centre crop (L0); --sim is the similarity alignment (L1); --flow DIR resamples through the
  * dense flow W(p) = T(p + alpha u(p)) with DIR's own u.plxt, sim.plxt and quality.plxt (L2).
  * Texture flags: --alpha A (fraction of the flow applied, default 1), --jconf P (confidence *=
- *   clamp(det(I + alpha grad u), 0, 1)^P; 0 = off), --fallback BITS (images whose flow quality
+ *   clamp(det(I + alpha grad u), 0, 1)^P; 0 = off; --jconf-mirror uses det(p) / det(mirror of p)
+ *   instead, i.e. only pose-driven asymmetric stretch), --fallback BITS (images whose flow quality
  *   flags intersect BITS use alpha = 0), --conf FILE (f32 [N, 160, 128] confidence planes from
  *   outside, multiplied in: the seam for depth-derived visibility), --codes FILE (f32 [N, K]
  *   non-texture codes appended to every descriptor as one more block: the seam for geometry codes).
@@ -129,11 +130,12 @@ typedef struct {
     float alpha;     /* fraction of the flow field applied */
     float jpow;      /* > 0: confidence *= clamp(det(I + alpha grad u), 0, 1)^jpow */
     int   fallback;  /* images whose flow quality flags intersect this mask use alpha = 0 */
+    bool  jmirror;   /* stretch relative to the mirror partner (pose only, not face width) */
 } tex_opts;
 
 static tex_opts tex_from_args(const plx_args *a) {
     return (tex_opts){.alpha = (float)plx_arg_num(a, "alpha", 1.0), .jpow = (float)plx_arg_num(a, "jconf", 0.0),
-                      .fallback = (int)plx_arg_int(a, "fallback", 0)};
+                      .fallback = (int)plx_arg_int(a, "fallback", 0), .jmirror = plx_arg_flag(a, "jconf-mirror")};
 }
 
 static float *load_f32(const char *path, int64_t rows, int64_t cols, int64_t *cols_out) {
@@ -228,6 +230,7 @@ static void texture_of(const dataset *ds, const tex_opts *to, int i, plx_img *te
         if (to->jpow > 0.0f && alpha > 0.0f) {
             plx_img jdet = plx_img_new(PLX_REC_TEX_W, PLX_REC_TEX_H, 1);
             plx_rec_flow_jdet(u, alpha, &jdet);
+            if (to->jmirror) plx_rec_jdet_mirror_ratio(&jdet);
             plx_rec_conf_from_jdet(&jdet, to->jpow, conf);
             plx_img_free(&jdet);
         }
@@ -278,8 +281,8 @@ static void cache_key(const dataset *ds, const plx_desc_params *p, const tex_opt
     plx_desc_describe(p, d, sizeof d);
     int at = snprintf(buf, cap, "%s sim=%s", d, ds->sim_path ? ds->sim_path : "identity");
     if (ds->flow_dir && at > 0 && (size_t)at < cap)
-        at += snprintf(buf + at, cap - (size_t)at, " flow=%s alpha=%g jconf=%g fallback=%d", ds->flow_dir, to->alpha,
-                       to->jpow, to->fallback);
+        at += snprintf(buf + at, cap - (size_t)at, " flow=%s alpha=%g jconf=%g%s fallback=%d", ds->flow_dir, to->alpha,
+                       to->jpow, to->jmirror ? "(mirror ratio)" : "", to->fallback);
     if (ds->conf_path && at > 0 && (size_t)at < cap) at += snprintf(buf + at, cap - (size_t)at, " conf=%s", ds->conf_path);
     if (ds->codes_path && at > 0 && (size_t)at < cap) at += snprintf(buf + at, cap - (size_t)at, " codes=%s", ds->codes_path);
     if (at > 0 && (size_t)at < cap) snprintf(buf + at, cap - (size_t)at, "\n");
@@ -578,6 +581,7 @@ static const ablation_row FLOW[] = {
     {"+ stretch p=1, weighted mirror pooling", "--sup jb --alpha 1 --jconf 1 --mirror-weighted"},
     {"  same, p=2", "--sup jb --alpha 1 --jconf 2 --mirror-weighted"},
     {"  same, p=4", "--sup jb --alpha 1 --jconf 4 --mirror-weighted"},
+    {"+ mirror-ratio stretch p=2, weighted pooling", "--sup jb --alpha 1 --jconf 2 --jconf-mirror --mirror-weighted"},
     {"alpha 1, quality fallback fold|valid|step", "--sup jb --alpha 1 --fallback 26"},
     {"alpha 1, fallback also untrusted-by-congeal", "--sup jb --alpha 1 --fallback 27"},
 };

@@ -48,6 +48,11 @@ void plx_rec_texture_flow(const plx_img *gray, const float sim[4], const float *
  * plx_rec_conf_from_jdet multiplies conf in place by clamp(jdet, 0, 1)^power. */
 void plx_rec_flow_jdet(const float *u, float alpha, plx_img *jdet);
 void plx_rec_conf_from_jdet(const plx_img *jdet, float power, plx_img *conf);
+/* jdet(p) <- jdet(p) / jdet(σp) in place. A wide or narrow face is compressed or stretched
+ * symmetrically by the frontalising warp; that is the person's shape, not missing evidence. Pose
+ * foreshortens one side relative to its mirror partner, so the ratio keeps only the asymmetric
+ * (pose) part: below 1 on the far side of a turned face, above 1 on the near side. */
+void plx_rec_jdet_mirror_ratio(plx_img *jdet);
 
 /* ---- photometric normalisation (Tan & Triggs chain) -----------------------------------
  *   1. gamma:  v <- max(v, 0)^gamma              (gamma <= 0 or == 1: skipped)
